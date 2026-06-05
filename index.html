@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Constellation Simulator</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="loader">
+      <div class="loader-box">
+        <div class="loader-spinner"></div>
+        <p class="loader-msg">Loading…</p>
+      </div>
+    </div>
+    <div id="app">
+      <canvas id="canvas"></canvas>
+
+      <div id="stats" class="hud"></div>
+
+      <aside id="panel">
+        <h1>Constellation Simulator</h1>
+        <p class="subtitle">ODC + Starlink Gen1 / Gen2 overlay</p>
+
+        <section class="section">
+          <h2>Intro tour</h2>
+          <label class="row">
+            <input id="intro-mode" type="checkbox" checked />
+            Intro mode (one group at a time)
+          </label>
+          <p id="intro-status" class="hint"></p>
+          <div class="btn-row">
+            <button id="btn-intro-next" type="button" class="btn-primary">Add Group 2</button>
+            <button id="btn-intro-reset" type="button" class="btn-secondary">Reset</button>
+            <button id="btn-show-all" type="button" class="btn-secondary">Show all</button>
+          </div>
+        </section>
+
+        <section class="section controls">
+          <h2>Visualization</h2>
+          <label>
+            Track mode
+            <select id="track-mode">
+              <option value="all" selected>All planes</option>
+              <option value="shell">One shell</option>
+              <option value="selected">Selected plane only</option>
+            </select>
+          </label>
+          <label class="row">
+            <input id="show-ground-tracks" type="checkbox" checked />
+            Ground tracks on Earth
+          </label>
+          <label class="row">
+            <input id="show-shell-bands" type="checkbox" checked />
+            Altitude shell bands
+          </label>
+        </section>
+
+        <section class="section controls">
+          <h2>Scale</h2>
+          <label>
+            Density
+            <select id="density">
+              <option value="1">1:1 (cap 32/plane)</option>
+              <option value="10">1:10</option>
+              <option value="100" selected>1:100</option>
+              <option value="1000">1:1000</option>
+            </select>
+            <span id="density-val">1:100</span>
+          </label>
+          <label class="row">
+            <input id="exaggerate" type="checkbox" />
+            ×5 shell altitude separation
+          </label>
+          <label class="row">
+            <input id="auto-budget" type="checkbox" checked />
+            Auto FPS budget (satellites only)
+          </label>
+          <label>
+            Time scale
+            <input id="speed" type="range" min="1" max="200" value="80" />
+            <span id="speed-val">80×</span>
+          </label>
+          <label class="row">
+            <input id="show-tracks" type="checkbox" checked />
+            Orbital tracks (all planes)
+          </label>
+          <label class="row">
+            <input id="show-earth" type="checkbox" checked />
+            Earth
+          </label>
+          <label class="row">
+            <input id="earth-day-night" type="checkbox" checked />
+            Earth day/night
+          </label>
+        </section>
+
+        <details class="section advanced-section">
+          <summary>Advanced · 1M benchmark (optional)</summary>
+          <p class="hint">
+            Experimental scale mode: shader point cloud instead of satellite spheres. Same orbital math,
+            lower visual fidelity — for checking nominal counts at 1:100+ without loading 1M JS objects.
+          </p>
+          <label class="row">
+            <input id="odc-representative" type="checkbox" />
+            GPU representative mode
+          </label>
+          <label class="row">
+            <input id="auto-lod" type="checkbox" />
+            Auto LOD (GPU mode only — sparser points when zoomed out)
+          </label>
+        </details>
+
+        <section class="section">
+          <h2>Starlink deployment</h2>
+          <label>
+            View
+            <select id="starlink-view">
+              <option value="nominal" selected>Nominal (FCC filing shells)</option>
+              <option value="operational">Operational snapshot</option>
+            </select>
+          </label>
+          <div id="starlink-snapshot-row">
+            <label>
+              As-of date
+              <select id="deployment-snapshot"></select>
+            </label>
+            <p id="starlink-snapshot-hint" class="hint"></p>
+          </div>
+        </section>
+
+        <div id="starlink-operational-panel" class="section" hidden>
+          <h2>Starlink · operational</h2>
+          <label class="row">
+            <input id="starlink-deployed-master" type="checkbox" />
+            Show all operational shells
+          </label>
+          <p class="hint">Observed altitudes · counts = satellites in operational orbit today</p>
+          <ul id="starlink-deployed-shells" class="shell-list"></ul>
+        </div>
+
+        <div id="starlink-nominal-panel">
+        <section class="section">
+          <h2>Starlink Gen1</h2>
+          <label class="row">
+            <input id="starlink-master" type="checkbox" />
+            Show all Gen1 shells
+          </label>
+          <label>
+            Deployment
+            <select id="starlink-deployment">
+              <option value="authorized">As authorized (4,408 sats)</option>
+              <option value="deployed">As deployed (+475 km shells)</option>
+            </select>
+          </label>
+          <p class="hint">Gold tones · smaller satellites · FCC Apr 2020 modified auth</p>
+          <ul id="starlink-gen1-shells" class="shell-list"></ul>
+        </section>
+
+        <section class="section">
+          <h2>Starlink Gen2</h2>
+          <label class="row">
+            <input id="starlink-gen2-master" type="checkbox" />
+            Show all Gen2 shells
+          </label>
+          <label>
+            Mode
+            <select id="starlink-gen2-mode">
+              <option value="granted">Granted (DA-26-36 VLEO + 475–485 km)</option>
+              <option value="application">Full application (29,988 sats)</option>
+            </select>
+          </label>
+          <label id="starlink-gen2-inc365-row">
+            365 km inclination
+            <select id="starlink-gen2-inc365">
+              <option value="28">28° (default)</option>
+              <option value="32">32° (alternate)</option>
+            </select>
+          </label>
+          <p class="hint">Cool blue tones · VLEO 340–365 km sits below Gen1 (~540–570 km)</p>
+          <ul id="starlink-gen2-shells" class="shell-list"></ul>
+        </section>
+        </div>
+
+        <section class="section">
+          <h2>ODC groups</h2>
+          <ul id="groups"></ul>
+        </section>
+
+        <section class="section">
+          <h2>Shell inspector</h2>
+          <label class="row">
+            <input id="isolate-plane" type="checkbox" />
+            Isolate selected plane
+          </label>
+          <div id="inspector" class="inspector"></div>
+        </section>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
