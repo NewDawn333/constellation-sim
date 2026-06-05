@@ -3,9 +3,10 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
   ORBIT_GROUPS,
   buildConstellationModel,
-  starlinkGroupsForView,
   starlinkGroupsForMode,
   starlinkGen2GroupsForMode,
+  DEPLOYMENT_SNAPSHOTS,
+  deploymentSnapshotById,
   type StarlinkDeploymentMode,
   type StarlinkGen2Mode,
   type StarlinkGen2Inc365,
@@ -13,28 +14,42 @@ import {
   type UnifiedConstellation,
 } from "./constellation";
 import {
+  starlinkGroupsForScenario,
+  scenarioApplyHints,
+  type StarlinkScenarioId,
+} from "./data/starlinkScenarios";
+import { exportCanvasPng, screenshotFilename } from "./exportScreenshot";
+import {
+  readShareStateFromLocation,
+  shareUrlFromState,
+  type SimShareState,
+} from "./shareState";
+import {
   ConstellationRenderer,
   frameGroupCamera,
   type PlaneSelection,
   type TrackMode,
 } from "./constellationRenderer";
 import { createEarthScene } from "./render/earth";
+import { CoverageLayer } from "./render/coverageLayer";
+import type { HardwareClassFilter } from "./data/starlinkHardware";
+import { isStarlinkGroup } from "./data/groupConfig";
 import {
   DEFAULT_BUILD_PARAMS,
-  DENSITY_PRESETS,
+  DENSITY_STEPS,
+  densityStepIndex,
   type BuildParams,
-  type DensityPreset,
 } from "./orbits";
 import { ControlPanel } from "./ui";
 
-function nextDensity(current: DensityPreset): DensityPreset | null {
-  const i = DENSITY_PRESETS.indexOf(current);
-  return i < DENSITY_PRESETS.length - 1 ? DENSITY_PRESETS[i + 1]! : null;
+function nextDensityStep(current: number): number | null {
+  const i = densityStepIndex(current);
+  return i < DENSITY_STEPS.length - 1 ? DENSITY_STEPS[i + 1]! : null;
 }
 
-function prevDensity(current: DensityPreset): DensityPreset | null {
-  const i = DENSITY_PRESETS.indexOf(current);
-  return i > 0 ? DENSITY_PRESETS[i - 1]! : null;
+function prevDensityStep(current: number): number | null {
+  const i = densityStepIndex(current);
+  return i > 0 ? DENSITY_STEPS[i - 1]! : null;
 }
 
 function setLoader(msg: string, show: boolean): void {
@@ -62,21 +77,29 @@ async function main(): Promise<void> {
   let starlinkGen2Inc365: StarlinkGen2Inc365 = "28";
   let starlinkView: StarlinkViewMode = "nominal";
   let deploymentSnapshotId = "2026-06-03";
+  let starlinkScenario: StarlinkScenarioId = "today";
+  let minElevationDeg = 25;
+  let nightSideDimming = false;
+  let panel!: ControlPanel;
 
   function buildModel(): UnifiedConstellation {
-    const starlink = starlinkGroupsForView(starlinkView, deploymentSnapshotId, {
+    const starlink = starlinkGroupsForScenario(starlinkScenario, {
+      view: starlinkView,
+      snapshotId: deploymentSnapshotId,
       gen1Mode: starlinkDeployment,
       gen2Mode: starlinkGen2Mode,
       gen2Inc365: starlinkGen2Inc365,
     });
     const gen1 = starlink.filter((g) => g.layer === "starlink-gen1");
     const gen2 = starlink.filter((g) => g.layer === "starlink-gen2");
-    return buildConstellationModel(ORBIT_GROUPS, gen1, gen2, buildParams);
+    return buildConstellationModel(ORBIT_GROUPS, gen1, gen2, buildParams, {
+      enabledShellsByGroup: panel?.getEnabledOdcShellsByGroup?.() ?? new Map(),
+    });
   }
 
   let model: UnifiedConstellation = buildModel();
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
 
@@ -118,12 +141,101 @@ async function main(): Promise<void> {
   const constellation = new ConstellationRenderer(scene, earthGroup, model);
   constellation.setCamera(camera);
   constellation.setAutoLod(false);
-  constellation.setEnabledGroups(new Set([1]));
-  constellation.setShowTracks(true);
-  constellation.setShowGroundTracks(true);
-  constellation.setShowShellBands(true);
+  constellation.setEnabledGroups(new Set());
+  constellation.setShowTracks(false);
+  constellation.setShowGroundTracks(false);
+  constellation.setShowShellBands(false);
 
-  frameGroupCamera(ORBIT_GROUPS[0]!, camera, controls, buildParams.altitudeExaggeration);
+  const coverage = new CoverageLayer(earthGroup);
+
+  const timelineSnapshots = [...DEPLOYMENT_SNAPSHOTS].sort((a, b) =>
+    a.asOf.localeCompare(b.asOf)
+  );
+  let coverageTimelineTimer: ReturnType<typeof setInterval> | null = null;
+  let coverageTimelineIndex = 0;
+
+  function stopCoverageTimeline(): void {
+    if (coverageTimelineTimer !== null) {
+      clearInterval(coverageTimelineTimer);
+      coverageTimelineTimer = null;
+    }
+    const btn = document.getElementById("btn-coverage-timeline") as HTMLButtonElement | null;
+    if (btn) btn.textContent = "Play timeline";
+  }
+
+  function applyDeploymentSnapshot(snapshotId: string): void {
+    deploymentSnapshotId = snapshotId;
+    const sel = document.getElementById("deployment-snapshot") as HTMLSelectElement;
+    sel.value = snapshotId;
+    rebuildConstellation();
+    coverage.invalidate();
+    panel.applyStarlinkViewMode();
+  }
+
+  function ensureOperationalForCoverage(): void {
+    if (starlinkView === "operational") return;
+    starlinkView = "operational";
+    (document.getElementById("starlink-view") as HTMLSelectElement).value = "operational";
+    panel.applyStarlinkViewMode();
+    panel.setStarlinkDeployedMaster(true);
+    rebuildConstellation();
+    syncRendererFromPanel();
+    coverage.invalidate();
+  }
+
+  function coverageHudNote(): string {
+    if (!coverage.isVisible()) return "";
+    if (starlinkView !== "operational") {
+      return "Service map · switch to Operational snapshot";
+    }
+    return coverage.formatStatsLine();
+  }
+
+  function suspendServiceOverlay(): void {
+    stopCoverageTimeline();
+    coverage.setVisible(false);
+    (document.getElementById("show-coverage") as HTMLInputElement).checked = false;
+    (document.getElementById("show-bandwidth") as HTMLInputElement).checked = false;
+    hoverNote = "";
+    const readout = document.getElementById("bandwidth-readout");
+    if (readout) readout.textContent = "";
+  }
+
+  function isServiceOverlayActive(): boolean {
+    return starlinkView === "operational" && coverage.isVisible();
+  }
+
+  function syncServiceOverlayUi(): void {
+    panel.syncServiceOverlayControls(starlinkView === "operational");
+  }
+
+  function readBandwidthClassFilter(): HardwareClassFilter {
+    return {
+      v1: (document.getElementById("bw-filter-v1") as HTMLInputElement).checked,
+      v1_5: (document.getElementById("bw-filter-v1") as HTMLInputElement).checked,
+      v2m: (document.getElementById("bw-filter-v2m") as HTMLInputElement).checked,
+      dtcV1: (document.getElementById("bw-filter-dtc-v1") as HTMLInputElement).checked,
+      dtcV2: (document.getElementById("bw-filter-dtc-v2") as HTMLInputElement).checked,
+      v3: (document.getElementById("bw-filter-v3") as HTMLInputElement).checked,
+    };
+  }
+
+  function applyBandwidthOptions(): void {
+    coverage.setBandwidthOptions({
+      concurrency: Number((document.getElementById("bandwidth-concurrency") as HTMLInputElement).value) / 100,
+      layer: (document.getElementById("bandwidth-layer") as HTMLSelectElement).value as "broadband" | "dtc",
+      classFilter: readBandwidthClassFilter(),
+    });
+  }
+
+  function starlinkEnabledGroupIds(): Set<number> {
+    const enabled = panel.getEnabledGroups();
+    return new Set([...enabled].filter((id) => {
+      const g = model.groups.find((x) => x.id === id);
+      return g && isStarlinkGroup(g);
+    }));
+  }
+
 
   let simTime = 0;
   let timeScale = 80;
@@ -133,13 +245,153 @@ async function main(): Promise<void> {
   let budgetCooldown = 0;
   let highFpsStreak = 0;
   let ready = false;
+  let hoverNote = "";
+
+  const overlayRaycaster = new THREE.Raycaster();
+  const overlayPointer = new THREE.Vector2();
+  const sunDirEarthScratch = new THREE.Vector3();
+  const earthWorldScratch = new THREE.Vector3();
+  const earthInvScratch = new THREE.Matrix4();
+
+  function collectShareState(): SimShareState {
+    return {
+      v: 1,
+      scenario: starlinkScenario,
+      view: starlinkView,
+      snapshotId: deploymentSnapshotId,
+      density: buildParams.sampleDivisor,
+      showCoverage: (document.getElementById("show-coverage") as HTMLInputElement).checked,
+      showBandwidth: (document.getElementById("show-bandwidth") as HTMLInputElement).checked,
+      bandwidthLayer: (document.getElementById("bandwidth-layer") as HTMLSelectElement)
+        .value as "broadband" | "dtc",
+      concurrencyPct: Number((document.getElementById("bandwidth-concurrency") as HTMLInputElement).value),
+      minElevationDeg,
+      nightSideDimming,
+    };
+  }
+
+  function updateShareHash(): void {
+    const url = shareUrlFromState(collectShareState());
+    history.replaceState(null, "", url);
+  }
+
+  function applyShareState(state: SimShareState): void {
+    minElevationDeg = state.minElevationDeg;
+    nightSideDimming = state.nightSideDimming;
+    coverage.setGridOptions({ minElevationDeg, nightSideDimming });
+
+    const minElevEl = document.getElementById("min-elevation") as HTMLInputElement;
+    minElevEl.value = String(minElevationDeg);
+    (document.getElementById("min-elevation-val") as HTMLElement).textContent = `${minElevationDeg}°`;
+    (document.getElementById("night-side-dimming") as HTMLInputElement).checked = nightSideDimming;
+
+    (document.getElementById("bandwidth-layer") as HTMLSelectElement).value = state.bandwidthLayer;
+    const conc = document.getElementById("bandwidth-concurrency") as HTMLInputElement;
+    conc.value = String(state.concurrencyPct);
+    (document.getElementById("bandwidth-concurrency-val") as HTMLElement).textContent = `${state.concurrencyPct}%`;
+
+    buildParams = { ...buildParams, sampleDivisor: state.density };
+    panel.setDensityStepIndex(densityStepIndex(state.density));
+
+    applyScenario(state.scenario, {
+      skipHash: true,
+      view: state.view,
+      snapshotId: state.snapshotId,
+    });
+
+    if (state.showBandwidth) {
+      (document.getElementById("show-bandwidth") as HTMLInputElement).checked = true;
+      (document.getElementById("show-coverage") as HTMLInputElement).checked = false;
+      coverage.setDisplayMode("bandwidth");
+      applyBandwidthOptions();
+      coverage.setVisible(true);
+    } else if (state.showCoverage) {
+      (document.getElementById("show-coverage") as HTMLInputElement).checked = true;
+      (document.getElementById("show-bandwidth") as HTMLInputElement).checked = false;
+      coverage.setDisplayMode("coverage");
+      coverage.setVisible(true);
+    } else {
+      coverage.setVisible(false);
+    }
+    coverage.invalidate();
+    updateShareHash();
+  }
+
+  function applyScenario(
+    scenarioId: StarlinkScenarioId,
+    opts?: { skipHash?: boolean; view?: StarlinkViewMode; snapshotId?: string }
+  ): void {
+    starlinkScenario = scenarioId;
+    const hints = scenarioApplyHints(scenarioId);
+    starlinkView = opts?.view ?? hints.view;
+    deploymentSnapshotId = opts?.snapshotId ?? hints.snapshotId;
+    starlinkDeployment = hints.gen1Mode;
+    starlinkGen2Mode = hints.gen2Mode;
+    starlinkGen2Inc365 = hints.gen2Inc365;
+
+    panel.applyScenario(scenarioId);
+    panel.setStarlinkView(starlinkView, deploymentSnapshotId);
+    (document.getElementById("starlink-view") as HTMLSelectElement).value = starlinkView;
+    (document.getElementById("deployment-snapshot") as HTMLSelectElement).value = deploymentSnapshotId;
+    panel.applyStarlinkViewMode();
+
+    if (starlinkView === "nominal") {
+      suspendServiceOverlay();
+    }
+
+    rebuildConstellation();
+    syncRendererFromPanel();
+    syncServiceOverlayUi();
+    if (!opts?.skipHash) updateShareHash();
+  }
+
+  function updateSunDirectionEarthFixed(): void {
+    sunDirEarthScratch.copy(sunLight.position).normalize();
+    earthGroup.getWorldPosition(earthWorldScratch);
+    earthInvScratch.copy(earthGroup.matrixWorld).invert();
+    sunDirEarthScratch.transformDirection(earthInvScratch).normalize();
+    coverage.setSunDirectionEarthFixed(sunDirEarthScratch);
+  }
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!isServiceOverlayActive()) {
+      hoverNote = "";
+      const el = document.getElementById("bandwidth-readout");
+      if (el) el.textContent = "";
+      return;
+    }
+    if ((e.target as HTMLElement).closest("#panel")) return;
+
+    overlayPointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+    overlayPointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
+    overlayRaycaster.setFromCamera(overlayPointer, camera);
+    const hits = overlayRaycaster.intersectObject(coverage.mesh, false);
+    const readout = document.getElementById("bandwidth-readout")!;
+
+    if (hits.length === 0 || !hits[0]!.uv) {
+      hoverNote = "";
+      readout.textContent = "";
+      return;
+    }
+
+    const uv = hits[0]!.uv;
+    const cell = coverage.sampleHover(uv.x, uv.y);
+    if (!cell) {
+      hoverNote = "";
+      readout.textContent = "";
+      return;
+    }
+
+    hoverNote = coverage.formatHover(cell);
+    readout.textContent = hoverNote;
+  });
 
   const fpsSamples: number[] = [];
   let displayedFps = 60;
 
-  let panel!: ControlPanel;
 
   function syncRendererFromPanel(): void {
+    if (!panel) return;
     constellation.setEnabledGroups(panel.getEnabledGroups());
     constellation.setShowTracks((document.getElementById("show-tracks") as HTMLInputElement).checked);
     constellation.setShowGroundTracks((document.getElementById("show-ground-tracks") as HTMLInputElement).checked);
@@ -148,7 +400,7 @@ async function main(): Promise<void> {
   }
 
   function rebuildConstellation(): void {
-    const enabled = panel.getEnabledGroups();
+    const enabled = panel?.getEnabledGroups() ?? new Set<number>();
     model = buildModel();
     constellation.rebuild(model, enabled);
     syncRendererFromPanel();
@@ -157,7 +409,8 @@ async function main(): Promise<void> {
       const isolate = (document.getElementById("isolate-plane") as HTMLInputElement).checked;
       constellation.setSelection(sel, isolate);
     }
-    panel.updateGroupMetas();
+    panel?.updateOdcGroupMetas();
+    coverage.invalidate();
   }
 
   panel = new ControlPanel(
@@ -167,39 +420,23 @@ async function main(): Promise<void> {
         rebuildConstellation();
         budgetNote = "";
       },
+      onSatPointScaleChange(scale) {
+        buildParams = { ...buildParams, satPointScale: scale };
+        rebuildConstellation();
+      },
+      onOdcShellsChange() {
+        setLoader("Building ODC shells…", true);
+        requestAnimationFrame(() => {
+          rebuildConstellation();
+          setLoader("", false);
+        });
+      },
       onExaggerationChange(exaggeration) {
         buildParams = { ...buildParams, altitudeExaggeration: exaggeration };
         rebuildConstellation();
         const active = [...panel.getOdcEnabledGroups()].sort((a, b) => b - a)[0];
         const g = ORBIT_GROUPS.find((x) => x.id === active);
         if (g) frameGroupCamera(g, camera, controls, exaggeration);
-      },
-      onIntroNext() {
-        const step = panel.getIntroStep();
-        const g = ORBIT_GROUPS[step - 1]!;
-        frameGroupCamera(g, camera, controls, buildParams.altitudeExaggeration);
-      },
-      onIntroReset() {
-        frameGroupCamera(ORBIT_GROUPS[0]!, camera, controls, buildParams.altitudeExaggeration);
-      },
-      onIntroToggle(on) {
-        if (on) panel.resetIntro();
-      },
-      onGroupToggle() {
-        syncRendererFromPanel();
-      },
-      onShowAllGroups() {
-        setLoader("Building all ODC groups…", true);
-        requestAnimationFrame(() => {
-          syncRendererFromPanel();
-          frameGroupCamera(
-            ORBIT_GROUPS[ORBIT_GROUPS.length - 1]!,
-            camera,
-            controls,
-            buildParams.altitudeExaggeration
-          );
-          setLoader("", false);
-        });
       },
       onPlaneSelect(sel: PlaneSelection | null, isolate: boolean) {
         constellation.setSelection(sel, isolate);
@@ -208,8 +445,11 @@ async function main(): Promise<void> {
           frameGroupCamera(g, camera, controls, buildParams.altitudeExaggeration);
         }
       },
-      onShellFocus(sel) {
-        constellation.setFocusShell(sel);
+      onShellFocusChange(shells) {
+        constellation.setFocusShells(shells);
+      },
+      onShellIsolateToggle(on) {
+        constellation.setIsolateShells(on);
       },
       onTrackMode(mode: TrackMode) {
         constellation.setTrackMode(mode);
@@ -243,6 +483,61 @@ async function main(): Promise<void> {
       },
       onEarthDayNightToggle(enabled) {
         setEarthDayNight(enabled);
+      },
+      onCoverageToggle(show) {
+        if (show) {
+          ensureOperationalForCoverage();
+          (document.getElementById("show-bandwidth") as HTMLInputElement).checked = false;
+          coverage.setDisplayMode("coverage");
+        }
+        coverage.setVisible(show);
+        if (!show) stopCoverageTimeline();
+        coverage.invalidate();
+      },
+      onCoverageGapsToggle(show) {
+        coverage.setShowGaps(show);
+      },
+      onBandwidthToggle(show) {
+        if (show) {
+          ensureOperationalForCoverage();
+          (document.getElementById("show-coverage") as HTMLInputElement).checked = false;
+          coverage.setDisplayMode("bandwidth");
+          applyBandwidthOptions();
+        }
+        coverage.setVisible(show);
+        if (!show) stopCoverageTimeline();
+        coverage.invalidate();
+      },
+      onBandwidthLayerChange(_layer) {
+        applyBandwidthOptions();
+      },
+      onBandwidthConcurrencyChange(factor) {
+        coverage.setBandwidthOptions({ concurrency: factor });
+      },
+      onBandwidthClassFilterChange() {
+        applyBandwidthOptions();
+      },
+      onCoverageTimelineToggle(play) {
+        if (!play) {
+          stopCoverageTimeline();
+          return;
+        }
+        ensureOperationalForCoverage();
+        coverage.setVisible(true);
+        if (coverage.getDisplayMode() === "bandwidth") {
+          (document.getElementById("show-bandwidth") as HTMLInputElement).checked = true;
+        } else {
+          coverage.setDisplayMode("coverage");
+          (document.getElementById("show-coverage") as HTMLInputElement).checked = true;
+        }
+        coverageTimelineIndex = 0;
+        const btn = document.getElementById("btn-coverage-timeline") as HTMLButtonElement;
+        btn.textContent = "Stop timeline";
+        applyDeploymentSnapshot(timelineSnapshots[coverageTimelineIndex]!.id);
+        coverageTimelineTimer = setInterval(() => {
+          coverageTimelineIndex = (coverageTimelineIndex + 1) % timelineSnapshots.length;
+          applyDeploymentSnapshot(timelineSnapshots[coverageTimelineIndex]!.id);
+        }, 3500);
       },
       onTimeScale(scale) {
         timeScale = scale;
@@ -320,11 +615,15 @@ async function main(): Promise<void> {
       onStarlinkViewChange(view, snapshotId) {
         starlinkView = view;
         deploymentSnapshotId = snapshotId;
+        if (view === "nominal") {
+          suspendServiceOverlay();
+        }
         if (view === "operational") {
           panel.setStarlinkDeployedMaster(true);
         }
         rebuildConstellation();
         panel.applyStarlinkViewMode();
+        syncServiceOverlayUi();
         syncRendererFromPanel();
       },
       onStarlinkDeployedMasterToggle(on) {
@@ -349,10 +648,69 @@ async function main(): Promise<void> {
           syncRendererFromPanel();
         }
       },
+      onStarlinkGen3MasterToggle(on) {
+        if (on) {
+          setLoader("Building Gen3 shells…", true);
+          requestAnimationFrame(() => {
+            syncRendererFromPanel();
+            setLoader("", false);
+          });
+        } else {
+          syncRendererFromPanel();
+        }
+      },
+      onStarlinkGen3ShellToggle(id, enabled) {
+        if (enabled) {
+          setLoader(`Building Gen3 shell ${id}…`, true);
+          requestAnimationFrame(() => {
+            syncRendererFromPanel();
+            setLoader("", false);
+          });
+        } else {
+          syncRendererFromPanel();
+        }
+      },
+      onScenarioChange(scenarioId) {
+        applyScenario(scenarioId);
+      },
+      onMinElevationChange(deg) {
+        minElevationDeg = deg;
+        coverage.setGridOptions({ minElevationDeg });
+        updateShareHash();
+      },
+      onNightSideDimmingChange(on) {
+        nightSideDimming = on;
+        coverage.setGridOptions({ nightSideDimming });
+        updateShareHash();
+      },
+      onExportScreenshot() {
+        renderer.render(scene, camera);
+        exportCanvasPng(canvas, screenshotFilename());
+        panel.setShareStatus("PNG saved");
+      },
+      onCopyShareLink() {
+        updateShareHash();
+        const url = shareUrlFromState(collectShareState());
+        navigator.clipboard.writeText(url).then(
+          () => panel.setShareStatus("Share link copied"),
+          () => panel.setShareStatus(url)
+        );
+      },
     },
     () => model,
     () => constellation
   );
+
+  syncServiceOverlayUi();
+
+  const shared = readShareStateFromLocation();
+  if (shared) {
+    applyShareState(shared);
+  } else {
+    applyScenario("today", { skipHash: true });
+    coverage.setGridOptions({ minElevationDeg, nightSideDimming });
+    updateShareHash();
+  }
 
   const clock = new THREE.Clock();
 
@@ -362,10 +720,10 @@ async function main(): Promise<void> {
     if (budgetCooldown > 0) return;
 
     if (fps < 38) {
-      const next = nextDensity(buildParams.sampleDivisor);
+      const next = nextDensityStep(buildParams.sampleDivisor);
       if (next) {
         buildParams = { ...buildParams, sampleDivisor: next };
-        panel.setDensity(next);
+        panel.setDensityStepIndex(densityStepIndex(next));
         rebuildConstellation();
         budgetNote = `Auto: lowered density → 1:${next}`;
         budgetCooldown = 3;
@@ -378,12 +736,12 @@ async function main(): Promise<void> {
     else highFpsStreak = 0;
 
     if (highFpsStreak > 5) {
-      const prev = prevDensity(buildParams.sampleDivisor);
+      const prev = prevDensityStep(buildParams.sampleDivisor);
       if (prev) {
         buildParams = { ...buildParams, sampleDivisor: prev };
-        panel.setDensity(prev);
+        panel.setDensityStepIndex(densityStepIndex(prev));
         rebuildConstellation();
-        budgetNote = `Auto: raised density → 1:${prev === 1 ? "1 (cap)" : prev}`;
+        budgetNote = `Auto: raised density → 1:${prev === 1 ? "1 (every sat)" : prev}`;
         budgetCooldown = 4;
       }
       highFpsStreak = 0;
@@ -404,7 +762,19 @@ async function main(): Promise<void> {
     tickBudget(dt, displayedFps);
 
     const drawn = constellation.updateInstances(simTime);
-    panel.updateStats(model, displayedFps, drawn, budgetNote);
+    if (isServiceOverlayActive()) {
+      updateSunDirectionEarthFixed();
+      coverage.update(
+        model.groups,
+        starlinkEnabledGroupIds(),
+        simTime,
+        deploymentSnapshotById(deploymentSnapshotId)?.asOf ?? deploymentSnapshotId,
+        earthGroup
+      );
+    }
+
+    const hudNote = [budgetNote, coverageHudNote(), hoverNote].filter(Boolean).join(" · ");
+    panel.updateStats(model, displayedFps, drawn, hudNote);
 
     controls.update();
     renderer.render(scene, camera);

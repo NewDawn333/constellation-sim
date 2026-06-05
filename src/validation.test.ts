@@ -378,6 +378,190 @@ describe("Starlink operational snapshots", () => {
   });
 });
 
+describe("coverage footprints", () => {
+  it("550 km / 25° footprint ground radius is ~940 km", async () => {
+    const { footprintGroundRadiusKm } = await import("./model/coverageGrid");
+    const r = footprintGroundRadiusKm(550, 25);
+    expect(r).toBeGreaterThan(850);
+    expect(r).toBeLessThan(1050);
+  });
+
+  it("angular distance at equator matches haversine", async () => {
+    const { angularDistanceDeg } = await import("./model/coverageGrid");
+    expect(angularDistanceDeg(0, 0, 0, 1)).toBeCloseTo(1, 0);
+    expect(angularDistanceDeg(0, 0, 0, 90)).toBeCloseTo(90, 0);
+  });
+
+  it("maps DTC shells to dtc-v2 after 2025", async () => {
+    const { hardwareClassForShellId } = await import("./data/starlinkHardware");
+    expect(hardwareClassForShellId(403, "2024-01-01")).toBe("dtc-v1");
+    expect(hardwareClassForShellId(403, "2026-06-03")).toBe("dtc-v2");
+  });
+
+  it("early snapshot has lower coverage than Jun 2026", async () => {
+    const THREE = await import("three");
+    const { buildCoverageGrid } = await import("./model/coverageGrid");
+    const { starlinkDeployedGroups } = await import("./data/starlinkDeployed");
+    const earth = new THREE.Group();
+
+    const early = starlinkDeployedGroups("2020-01-01");
+    const today = starlinkDeployedGroups("2026-06-03");
+    const enabledEarly = new Set(early.map((g) => g.id));
+    const enabledToday = new Set(today.map((g) => g.id));
+
+    const rEarly = buildCoverageGrid(early, enabledEarly, 0, "2020-01-01", earth);
+    const rToday = buildCoverageGrid(today, enabledToday, 0, "2026-06-03", earth);
+
+    expect(rEarly.contributingSats).toBeLessThan(rToday.contributingSats);
+    expect(rEarly.coverageFraction).toBeLessThan(rToday.coverageFraction);
+  });
+});
+
+describe("bandwidth heatmap", () => {
+  it("footprint at 550 km spans hundreds of grid cells", async () => {
+    const { estimateFootprintCellCount, footprintRadiusDeg } = await import("./model/coverageGrid");
+    const r = footprintRadiusDeg(550, 25);
+    const n = estimateFootprintCellCount(r);
+    expect(n).toBeGreaterThan(200);
+    expect(n).toBeLessThan(5000);
+  });
+
+  it("Jun 2026 nominal downlink is within 2× of public ~450 Tbps cumulative", async () => {
+    const THREE = await import("three");
+    const { buildCapacityGrid } = await import("./model/coverageGrid");
+    const { DEFAULT_HARDWARE_FILTER } = await import("./data/starlinkHardware");
+    const { starlinkDeployedGroups } = await import("./data/starlinkDeployed");
+    const earth = new THREE.Group();
+
+    const groups = starlinkDeployedGroups("2026-06-03");
+    const enabled = new Set(groups.map((g) => g.id));
+    const r = buildCapacityGrid(groups, enabled, 0, "2026-06-03", earth, {
+      concurrency: 1,
+      layer: "broadband",
+      classFilter: DEFAULT_HARDWARE_FILTER,
+    });
+
+    const tbps = r.totalNominalGbps / 1000;
+    expect(tbps).toBeGreaterThan(225);
+    expect(tbps).toBeLessThan(900);
+  });
+
+  it("2026 peak cell bandwidth exceeds 2021 with concurrency applied", async () => {
+    const THREE = await import("three");
+    const { buildCapacityGrid } = await import("./model/coverageGrid");
+    const { DEFAULT_HARDWARE_FILTER } = await import("./data/starlinkHardware");
+    const { starlinkDeployedGroups } = await import("./data/starlinkDeployed");
+    const earth = new THREE.Group();
+
+    const opts = { concurrency: 0.3, layer: "broadband" as const, classFilter: DEFAULT_HARDWARE_FILTER };
+    const g2021 = starlinkDeployedGroups("2021-01-01");
+    const g2026 = starlinkDeployedGroups("2026-06-03");
+    const r2021 = buildCapacityGrid(g2021, new Set(g2021.map((x) => x.id)), 0, "2021-01-01", earth, opts);
+    const r2026 = buildCapacityGrid(g2026, new Set(g2026.map((x) => x.id)), 0, "2026-06-03", earth, opts);
+
+    expect(r2026.peakCellGbps).toBeGreaterThan(r2021.peakCellGbps);
+    expect(r2026.totalNominalGbps).toBeGreaterThan(r2021.totalNominalGbps * 5);
+  });
+
+  it("DTC layer excludes broadband shells", async () => {
+    const THREE = await import("three");
+    const { buildCapacityGrid } = await import("./model/coverageGrid");
+    const { DEFAULT_HARDWARE_FILTER } = await import("./data/starlinkHardware");
+    const { starlinkDeployedGroups } = await import("./data/starlinkDeployed");
+    const earth = new THREE.Group();
+
+    const groups = starlinkDeployedGroups("2026-06-03");
+    const enabled = new Set(groups.map((g) => g.id));
+    const bb = buildCapacityGrid(groups, enabled, 0, "2026-06-03", earth, {
+      concurrency: 0.3,
+      layer: "broadband",
+      classFilter: DEFAULT_HARDWARE_FILTER,
+    });
+    const dtc = buildCapacityGrid(groups, enabled, 0, "2026-06-03", earth, {
+      concurrency: 0.3,
+      layer: "dtc",
+      classFilter: DEFAULT_HARDWARE_FILTER,
+    });
+
+    expect(dtc.contributingSats).toBeLessThan(bb.contributingSats);
+    expect(dtc.totalNominalGbps).toBeLessThan(bb.totalNominalGbps);
+  });
+});
+
+describe("Phase 9 · scenarios & share", () => {
+  it("gen2-full scenario includes application shells", async () => {
+    const { starlinkGroupsForScenario } = await import("./data/starlinkScenarios");
+    const groups = starlinkGroupsForScenario("gen2-full", {
+      view: "nominal",
+      snapshotId: "2026-06-03",
+      gen1Mode: "deployed",
+      gen2Mode: "application",
+      gen2Inc365: "28",
+    });
+    expect(groups.some((g) => g.id === 211)).toBe(true);
+    expect(groups.reduce((n, g) => n + g.maxSats, 0)).toBeGreaterThan(25_000);
+  });
+
+  it("gen3-partial adds future shells marked future", async () => {
+    const { starlinkGroupsForScenario } = await import("./data/starlinkScenarios");
+    const { STARLINK_GEN3_PARTIAL_NOMINAL } = await import("./data/starlinkGen3");
+    const groups = starlinkGroupsForScenario("gen3-partial", {
+      view: "operational",
+      snapshotId: "2026-06-03",
+      gen1Mode: "deployed",
+      gen2Mode: "granted",
+      gen2Inc365: "28",
+    });
+    const future = groups.filter((g) => g.future);
+    expect(future.length).toBe(4);
+    expect(future.every((g) => g.id >= 501)).toBe(true);
+    expect(future.reduce((n, g) => n + g.maxSats, 0)).toBe(STARLINK_GEN3_PARTIAL_NOMINAL);
+  });
+
+  it("future groups are excluded from coverage stamps", async () => {
+    const THREE = await import("three");
+    const { buildCoverageGrid } = await import("./model/coverageGrid");
+    const { STARLINK_GEN3_PARTIAL } = await import("./data/starlinkGen3");
+    const earth = new THREE.Group();
+    const enabled = new Set(STARLINK_GEN3_PARTIAL.map((g) => g.id));
+    const r = buildCoverageGrid(STARLINK_GEN3_PARTIAL, enabled, 0, "2026-06-03", earth);
+    expect(r.contributingSats).toBe(0);
+    expect(r.coverageFraction).toBe(0);
+  });
+
+  it("min elevation slider shrinks footprint", async () => {
+    const { footprintGroundRadiusKm } = await import("./model/coverageGrid");
+    const wide = footprintGroundRadiusKm(550, 15);
+    const narrow = footprintGroundRadiusKm(550, 35);
+    expect(wide).toBeGreaterThan(narrow);
+  });
+
+  it("Gen3 shell ids map to v3 hardware", async () => {
+    const { hardwareClassForShellId } = await import("./data/starlinkHardware");
+    expect(hardwareClassForShellId(501)).toBe("v3");
+  });
+
+  it("share state round-trips through URL hash", async () => {
+    const { encodeShareState, decodeShareState } = await import("./shareState");
+    const state = {
+      v: 1 as const,
+      scenario: "gen3-partial" as const,
+      view: "operational" as const,
+      snapshotId: "2026-06-03",
+      density: 100 as const,
+      showCoverage: true,
+      showBandwidth: false,
+      bandwidthLayer: "broadband" as const,
+      concurrencyPct: 30,
+      minElevationDeg: 20,
+      nightSideDimming: true,
+    };
+    const encoded = encodeShareState(state);
+    const decoded = decodeShareState(encoded);
+    expect(decoded).toEqual(state);
+  });
+});
+
 describe("polar vs inclined topology", () => {
   it("polar groups use 2 planes per shell, inclined use 30", () => {
     const polar = ORBIT_GROUPS.filter((g) => g.planesPerShell === 2);

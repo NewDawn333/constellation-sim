@@ -22,6 +22,12 @@ export interface OrbitGroupConfig {
   satLayout?: SatLayoutMode;
   /** Satellites per Falcon 9 launch when satLayout is launch_train. */
   launchTrainSize?: number;
+  /** Planned / not-yet-operational shell — dashed tracks, excluded from coverage stamps. */
+  future?: boolean;
+}
+
+export function isFutureGroup(g: OrbitGroupConfig): boolean {
+  return g.future === true;
 }
 
 export function formatInclination(inc: number | [number, number]): string {

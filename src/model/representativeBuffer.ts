@@ -62,12 +62,20 @@ export function buildRepresentativeSatBuffer(
   const [lo, hi] = g.altitudeKm;
   const divisor = params.sampleDivisor;
   const visPerPlane = representativeDisplaySatsPerPlane(g.satsPerPlane, divisor);
-  const nominalSats = representativeNominalTotal(g);
-  const displaySats = g.shells * g.planesPerShell * visPerPlane;
-  const elements = new Float32Array(displaySats * GPU_ELEMENTS_STRIDE);
+  const enabledShells = params.enabledShellIndices;
+  let displaySats = 0;
+  for (let sh = 0; sh < g.shells; sh++) {
+    if (enabledShells && !enabledShells.has(sh)) continue;
+    displaySats += g.planesPerShell * visPerPlane;
+  }
+  const nominalSats = enabledShells
+    ? enabledShells.size * g.planesPerShell * g.satsPerPlane
+    : representativeNominalTotal(g);
+  const elements = new Float32Array(Math.max(displaySats, 1) * GPU_ELEMENTS_STRIDE);
 
   let idx = 0;
   for (let sh = 0; sh < g.shells; sh++) {
+    if (enabledShells && !enabledShells.has(sh)) continue;
     const physical = shellAltitudeKm(lo, hi, sh, g.shells);
     const visual = effectiveVisualAlt(lo, hi, sh, g.shells, params.altitudeExaggeration);
     const incRad = (shellInclinationDeg(g.inclinationDeg, sh, g.shells) * Math.PI) / 180;

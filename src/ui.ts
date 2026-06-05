@@ -1,6 +1,5 @@
 import {
   computeStats,
-  groupNominalBreakdown,
   ORBIT_GROUPS,
   ODC_NOMINAL_TOTAL,
   ODC_POLAR_NOMINAL_TOTAL,
@@ -26,21 +25,25 @@ import {
   type StarlinkGen2Mode,
   type StarlinkGen2Inc365,
   type StarlinkViewMode,
-  groupLabel,
 } from "./constellation";
+import { STARLINK_GEN3_PARTIAL, starlinkGen3ShellLabel } from "./data/starlinkGen3";
+import {
+  STARLINK_SCENARIOS,
+  scenarioApplyHints,
+  type StarlinkScenarioId,
+} from "./data/starlinkScenarios";
 import type { ConstellationRenderer, PlaneSelection, ShellSelection, TrackMode } from "./constellationRenderer";
-import { DENSITY_PRESETS, type BuildParams, type DensityPreset } from "./orbits";
+import { shellSelectionKey } from "./constellationRenderer";
+import { DENSITY_STEPS, formatDensityLabel, formatSatSizeLabel, satSizeSliderToScale, type BuildParams } from "./orbits";
 
 export interface SimUIHandlers {
-  onDensityChange: (divisor: DensityPreset) => void;
+  onDensityChange: (divisor: number) => void;
+  onSatPointScaleChange: (scale: number) => void;
   onExaggerationChange: (exaggeration: number) => void;
-  onIntroNext: () => void;
-  onIntroReset: () => void;
-  onIntroToggle: (on: boolean) => void;
-  onGroupToggle: (groupId: number, enabled: boolean) => void;
-  onShowAllGroups: () => void;
+  onOdcShellsChange: () => void;
   onPlaneSelect: (sel: PlaneSelection | null, isolate: boolean) => void;
-  onShellFocus: (sel: ShellSelection | null) => void;
+  onShellFocusChange: (shells: ShellSelection[]) => void;
+  onShellIsolateToggle: (on: boolean) => void;
   onTrackMode: (mode: TrackMode) => void;
   onShowGroundTracks: (show: boolean) => void;
   onShowShellBands: (show: boolean) => void;
@@ -48,6 +51,13 @@ export interface SimUIHandlers {
   onShowTracks: (show: boolean) => void;
   onShowEarth: (show: boolean) => void;
   onEarthDayNightToggle: (enabled: boolean) => void;
+  onCoverageToggle: (show: boolean) => void;
+  onCoverageGapsToggle: (show: boolean) => void;
+  onBandwidthToggle: (show: boolean) => void;
+  onBandwidthLayerChange: (layer: "broadband" | "dtc") => void;
+  onBandwidthConcurrencyChange: (factor: number) => void;
+  onBandwidthClassFilterChange: () => void;
+  onCoverageTimelineToggle: (play: boolean) => void;
   onTimeScale: (scale: number) => void;
   onStarlinkMasterToggle: (on: boolean) => void;
   onStarlinkShellToggle: (groupId: number, enabled: boolean) => void;
@@ -59,31 +69,41 @@ export interface SimUIHandlers {
   onStarlinkViewChange: (view: StarlinkViewMode, snapshotId: string) => void;
   onStarlinkDeployedMasterToggle: (on: boolean) => void;
   onStarlinkDeployedShellToggle: (groupId: number, enabled: boolean) => void;
+  onStarlinkGen3ShellToggle: (groupId: number, enabled: boolean) => void;
+  onStarlinkGen3MasterToggle: (on: boolean) => void;
+  onScenarioChange: (scenarioId: StarlinkScenarioId) => void;
+  onMinElevationChange: (deg: number) => void;
+  onNightSideDimmingChange: (on: boolean) => void;
+  onExportScreenshot: () => void;
+  onCopyShareLink: () => void;
   onOdcRepresentativeModeChange: (on: boolean) => void;
   onAutoLodToggle: (on: boolean) => void;
 }
 
 export class ControlPanel {
-  private enabledGroups = new Set<number>([1]);
+  private enabledOdcShells = new Map<number, Set<number>>();
   private enabledStarlinkGen1 = new Set<number>();
   private enabledStarlinkGen2 = new Set<number>();
   private enabledStarlinkDeployed = new Set<number>();
+  private enabledStarlinkGen3 = new Set<number>();
+  private starlinkScenario: StarlinkScenarioId = "today";
   private starlinkView: StarlinkViewMode = "nominal";
   private deploymentSnapshotId = "2026-06-03";
   private starlinkDeployment: StarlinkDeploymentMode = "authorized";
   private starlinkGen2Mode: StarlinkGen2Mode = "granted";
   private starlinkGen2Inc365: StarlinkGen2Inc365 = "28";
-  private introMode = true;
-  private introStep = 1;
   private isolatePlane = false;
+  private focusedShells = new Set<string>();
+  private densityStepIndex = 6;
 
   private readonly statsEl: HTMLElement;
-  private readonly introStatusEl: HTMLElement;
   private readonly inspectorEl: HTMLElement;
-  private readonly groupCheckboxes = new Map<number, HTMLInputElement>();
+  private readonly odcGroupCheckboxes = new Map<number, HTMLInputElement>();
+  private readonly odcShellCheckboxes = new Map<string, HTMLInputElement>();
   private readonly starlinkGen1Checkboxes = new Map<number, HTMLInputElement>();
   private readonly starlinkGen2Checkboxes = new Map<number, HTMLInputElement>();
   private readonly starlinkDeployedCheckboxes = new Map<number, HTMLInputElement>();
+  private readonly starlinkGen3Checkboxes = new Map<number, HTMLInputElement>();
 
   constructor(
     private handlers: SimUIHandlers,
@@ -91,24 +111,48 @@ export class ControlPanel {
     private getRenderer: () => ConstellationRenderer
   ) {
     this.statsEl = document.getElementById("stats")!;
-    this.introStatusEl = document.getElementById("intro-status")!;
     this.inspectorEl = document.getElementById("inspector")!;
 
     this.wireControls();
+    this.buildOdcGroupPanel();
     this.buildInspector();
-    this.syncIntroUI();
     this.refreshStats();
   }
 
-  getEnabledGroups(): Set<number> {
-    if (this.starlinkView === "operational") {
-      return new Set([...this.enabledGroups, ...this.enabledStarlinkDeployed]);
+  getEnabledOdcShellsByGroup(): Map<number, Set<number>> {
+    return this.enabledOdcShells;
+  }
+
+  private odcEnabledGroupIds(): Set<number> {
+    const ids = new Set<number>();
+    for (const [gid, shells] of this.enabledOdcShells) {
+      if (shells.size > 0) ids.add(gid);
     }
-    return new Set([...this.enabledGroups, ...this.enabledStarlinkGen1, ...this.enabledStarlinkGen2]);
+    return ids;
+  }
+
+  getEnabledGroups(): Set<number> {
+    const odc = this.odcEnabledGroupIds();
+    if (this.starlinkScenario === "gen3-partial" && this.starlinkView === "operational") {
+      return new Set([...odc, ...this.enabledStarlinkDeployed, ...this.enabledStarlinkGen3]);
+    }
+    if (this.starlinkView === "operational") {
+      return new Set([...odc, ...this.enabledStarlinkDeployed]);
+    }
+    return new Set([...odc, ...this.enabledStarlinkGen1, ...this.enabledStarlinkGen2]);
+  }
+
+  getStarlinkScenario(): StarlinkScenarioId {
+    return this.starlinkScenario;
   }
 
   getStarlinkView(): StarlinkViewMode {
     return this.starlinkView;
+  }
+
+  setStarlinkView(view: StarlinkViewMode, snapshotId?: string): void {
+    this.starlinkView = view;
+    if (snapshotId !== undefined) this.deploymentSnapshotId = snapshotId;
   }
 
   getEnabledStarlinkDeployed(): Set<number> {
@@ -124,13 +168,93 @@ export class ControlPanel {
     const nominalPanel = document.getElementById("starlink-nominal-panel")!;
     const operationalPanel = document.getElementById("starlink-operational-panel")!;
     const snapshotRow = document.getElementById("starlink-snapshot-row")!;
+    const gen3Panel = document.getElementById("starlink-gen3-panel")!;
     const isOp = this.starlinkView === "operational";
     nominalPanel.hidden = isOp;
     operationalPanel.hidden = !isOp;
     snapshotRow.hidden = !isOp;
+    gen3Panel.hidden = !(isOp && this.starlinkScenario === "gen3-partial");
     this.updateDeploymentSnapshotHint();
     if (isOp) {
       this.rebuildStarlinkDeployedShellList();
+      if (this.starlinkScenario === "gen3-partial") {
+        this.rebuildStarlinkGen3ShellList();
+      }
+    }
+  }
+
+  applyScenario(scenarioId: StarlinkScenarioId): void {
+    this.starlinkScenario = scenarioId;
+    const hints = scenarioApplyHints(scenarioId);
+    this.starlinkView = hints.view;
+    this.deploymentSnapshotId = hints.snapshotId;
+    this.starlinkDeployment = hints.gen1Mode;
+    this.starlinkGen2Mode = hints.gen2Mode;
+    this.starlinkGen2Inc365 = hints.gen2Inc365;
+
+    const scenarioSel = document.getElementById("starlink-scenario") as HTMLSelectElement;
+    scenarioSel.value = scenarioId;
+    this.updateScenarioHint();
+
+    (document.getElementById("starlink-view") as HTMLSelectElement).value = hints.view;
+    (document.getElementById("deployment-snapshot") as HTMLSelectElement).value = hints.snapshotId;
+    (document.getElementById("starlink-deployment") as HTMLSelectElement).value = hints.gen1Mode;
+    (document.getElementById("starlink-gen2-mode") as HTMLSelectElement).value = hints.gen2Mode;
+    (document.getElementById("starlink-gen2-inc365") as HTMLSelectElement).value = hints.gen2Inc365;
+
+    if (hints.enableAllStarlink) {
+      if (hints.view === "operational") {
+        this.setStarlinkDeployedMaster(true);
+        if (scenarioId === "gen3-partial") {
+          this.setStarlinkGen3Master(true);
+        }
+      } else {
+        this.setStarlinkMaster(true);
+        this.setStarlinkGen2Master(true);
+      }
+    }
+
+    this.rebuildStarlinkGen1ShellList();
+    this.rebuildStarlinkGen2ShellList();
+    this.updateGen2Inc365Visibility();
+    this.applyStarlinkViewMode();
+  }
+
+  private updateScenarioHint(): void {
+    const hint = document.getElementById("starlink-scenario-hint")!;
+    const def = STARLINK_SCENARIOS.find((s) => s.id === this.starlinkScenario);
+    hint.textContent = def?.description ?? "";
+  }
+
+  setShareStatus(msg: string): void {
+    const el = document.getElementById("share-status");
+    if (el) el.textContent = msg;
+  }
+
+  /** Enable/disable coverage + bandwidth controls (operational snapshots only). */
+  syncServiceOverlayControls(operational: boolean): void {
+    const ids = [
+      "show-coverage",
+      "show-bandwidth",
+      "show-coverage-gaps",
+      "bandwidth-layer",
+      "bandwidth-concurrency",
+      "bw-filter-v1",
+      "bw-filter-v2m",
+      "bw-filter-dtc-v1",
+      "bw-filter-dtc-v2",
+      "bw-filter-v3",
+      "min-elevation",
+      "night-side-dimming",
+      "btn-coverage-timeline",
+    ];
+    for (const id of ids) {
+      const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | HTMLButtonElement | null;
+      if (el) el.disabled = !operational;
+    }
+    const hint = document.getElementById("service-overlay-hint");
+    if (hint) {
+      hint.hidden = operational;
     }
   }
 
@@ -180,56 +304,20 @@ export class ControlPanel {
   }
 
   getOdcEnabledGroups(): Set<number> {
-    return new Set(this.enabledGroups);
+    return this.odcEnabledGroupIds();
   }
 
-  isIntroMode(): boolean {
-    return this.introMode;
+  getDensityDivisor(): number {
+    return DENSITY_STEPS[this.densityStepIndex] ?? 100;
   }
 
-  getIntroStep(): number {
-    return this.introStep;
-  }
-
-  enableGroupOnly(groupId: number): void {
-    this.enabledGroups = new Set([groupId]);
-    this.syncGroupCheckboxes();
-    this.handlers.onGroupToggle(groupId, true);
-    for (const g of ORBIT_GROUPS) {
-      if (g.id !== groupId) this.handlers.onGroupToggle(g.id, false);
-    }
-    this.refreshStats();
-  }
-
-  advanceIntro(): void {
-    if (this.introStep >= ORBIT_GROUPS.length) return;
-    this.introStep++;
-    const g = ORBIT_GROUPS[this.introStep - 1]!;
-    this.enabledGroups.add(g.id);
-    this.syncGroupCheckboxes();
-    this.handlers.onGroupToggle(g.id, true);
-    this.handlers.onIntroNext();
-    this.syncIntroUI();
-    this.refreshStats();
-  }
-
-  resetIntro(): void {
-    this.introStep = 1;
-    this.enabledGroups = new Set([1]);
-    this.syncGroupCheckboxes();
-    for (const g of ORBIT_GROUPS) {
-      this.handlers.onGroupToggle(g.id, g.id === 1);
-    }
-    this.handlers.onIntroReset();
-    this.syncIntroUI();
-    this.refreshStats();
-  }
-
-  setDensity(divisor: DensityPreset): void {
-    const sel = document.getElementById("density") as HTMLSelectElement;
-    sel.value = String(divisor);
-    document.getElementById("density-val")!.textContent = divisor === 1 ? "1:1 (cap)" : `1:${divisor}`;
-    this.handlers.onDensityChange(divisor);
+  setDensityStepIndex(step: number): void {
+    this.densityStepIndex = Math.max(0, Math.min(DENSITY_STEPS.length - 1, step));
+    const slider = document.getElementById("density-slider") as HTMLInputElement;
+    const val = document.getElementById("density-val")!;
+    slider.value = String(this.densityStepIndex);
+    val.textContent = formatDensityLabel(this.getDensityDivisor());
+    this.handlers.onDensityChange(this.getDensityDivisor());
   }
 
   updateStats(model: UnifiedConstellation, fps: number, drawnSats: number, budgetNote: string): void {
@@ -266,7 +354,8 @@ export class ControlPanel {
         : "";
 
     this.statsEl.innerHTML = `
-      <div class="stat-row"><span>ODC (on)</span><strong>${stats.odc.nominalSats.toLocaleString()} / ${ODC_NOMINAL_TOTAL.toLocaleString()}</strong></div>
+      <div class="stat-row"><span>ODC drawn</span><strong>${drawnSats.toLocaleString()} / ${stats.odc.visibleSats.toLocaleString()} buf · ${formatDensityLabel(model.buildParams.sampleDivisor)}</strong></div>
+      <div class="stat-row"><span>ODC nominal (on)</span><strong>${stats.odc.nominalSats.toLocaleString()} / ${ODC_NOMINAL_TOTAL.toLocaleString()}</strong></div>
       <div class="stat-row"><span>ODC polar (on)</span><strong>${stats.odcPolar.nominalSats.toLocaleString()} / ${ODC_POLAR_NOMINAL_TOTAL.toLocaleString()}</strong></div>
       <div class="stat-row"><span>ODC inclined (on)</span><strong>${stats.odcInclined.nominalSats.toLocaleString()} / ${ODC_INCLINED_NOMINAL_TOTAL.toLocaleString()}</strong></div>
       ${this.getRepresentativeStatRow()}
@@ -275,7 +364,7 @@ export class ControlPanel {
       <div class="stat-row"><span>Starlink total (on)</span><strong>${(stats.starlinkGen1.nominalSats + stats.starlinkGen2.nominalSats).toLocaleString()} / ${starlinkTotalCap.toLocaleString()}</strong></div>
       <div class="stat-row"><span>Groups</span><strong>${stats.enabledGroups}</strong></div>
       <div class="stat-row"><span>Planes</span><strong>${stats.totalPlanes.toLocaleString()}</strong></div>
-      <div class="stat-row"><span>Sats drawn</span><strong>${drawnSats.toLocaleString()}</strong></div>
+      <div class="stat-row"><span>Sats in model</span><strong>${stats.visibleSats.toLocaleString()}</strong></div>
       <div class="stat-row"><span>Alt span</span><strong>${alt}</strong></div>
       <div class="stat-row"><span>FPS</span><strong>${fps.toFixed(0)}</strong></div>
       ${budgetNote ? `<div class="stat-budget">${budgetNote}</div>` : ""}
@@ -294,7 +383,7 @@ export class ControlPanel {
     let nominal = 0;
     let buffered = 0;
     for (const g of ORBIT_GROUPS) {
-      if (!this.enabledGroups.has(g.id)) continue;
+      if (!this.odcEnabledGroupIds().has(g.id)) continue;
       const buf = model.gpuBuffers.get(g.id);
       if (buf) {
         nominal += buf.nominalSats;
@@ -314,41 +403,37 @@ export class ControlPanel {
     });
     this.handlers.onTimeScale(Number(speedInput.value));
 
-    (document.getElementById("density") as HTMLSelectElement).addEventListener("change", (e) => {
-      const v = Number((e.target as HTMLSelectElement).value) as DensityPreset;
-      document.getElementById("density-val")!.textContent = v === 1 ? "1:1 (cap)" : `1:${v}`;
-      this.handlers.onDensityChange(v);
+    const densitySlider = document.getElementById("density-slider") as HTMLInputElement;
+    const densityVal = document.getElementById("density-val")!;
+    densitySlider.addEventListener("input", () => {
+      this.densityStepIndex = Number(densitySlider.value);
+      densityVal.textContent = formatDensityLabel(this.getDensityDivisor());
+      this.handlers.onDensityChange(this.getDensityDivisor());
     });
+    densityVal.textContent = formatDensityLabel(this.getDensityDivisor());
+
+    const satSize = document.getElementById("sat-size") as HTMLInputElement;
+    const satSizeVal = document.getElementById("sat-size-val")!;
+    satSize.addEventListener("input", () => {
+      const v = Number(satSize.value);
+      satSizeVal.textContent = formatSatSizeLabel(v);
+      this.handlers.onSatPointScaleChange(satSizeSliderToScale(v));
+    });
+    satSizeVal.textContent = formatSatSizeLabel(Number(satSize.value));
 
     (document.getElementById("exaggerate") as HTMLInputElement).addEventListener("change", (e) => {
       const on = (e.target as HTMLInputElement).checked;
       this.handlers.onExaggerationChange(on ? 5 : 1);
     });
 
-    document.getElementById("btn-intro-next")!.addEventListener("click", () => this.advanceIntro());
-    document.getElementById("btn-intro-reset")!.addEventListener("click", () => this.resetIntro());
-    document.getElementById("btn-show-all")!.addEventListener("click", () => {
-      this.introMode = false;
-      this.introStep = ORBIT_GROUPS.length;
-      this.enabledGroups = new Set(ORBIT_GROUPS.map((g) => g.id));
-      this.syncGroupCheckboxes();
-      this.handlers.onShowAllGroups();
-      (document.getElementById("intro-mode") as HTMLInputElement).checked = false;
-      this.syncIntroUI();
-      this.refreshStats();
-    });
-
-    (document.getElementById("intro-mode") as HTMLInputElement).addEventListener("change", (e) => {
-      this.introMode = (e.target as HTMLInputElement).checked;
-      if (this.introMode) this.resetIntro();
-      this.handlers.onIntroToggle(this.introMode);
-      this.syncIntroUI();
-    });
-
     (document.getElementById("isolate-plane") as HTMLInputElement).addEventListener("change", (e) => {
       this.isolatePlane = (e.target as HTMLInputElement).checked;
       const sel = this.getRenderer().getSelection();
       this.handlers.onPlaneSelect(sel, this.isolatePlane);
+    });
+
+    (document.getElementById("isolate-shells") as HTMLInputElement).addEventListener("change", (e) => {
+      this.handlers.onShellIsolateToggle((e.target as HTMLInputElement).checked);
     });
 
     (document.getElementById("auto-budget") as HTMLInputElement).addEventListener("change", (e) => {
@@ -377,6 +462,44 @@ export class ControlPanel {
 
     (document.getElementById("earth-day-night") as HTMLInputElement).addEventListener("change", (e) => {
       this.handlers.onEarthDayNightToggle((e.target as HTMLInputElement).checked);
+    });
+
+    (document.getElementById("show-coverage") as HTMLInputElement).addEventListener("change", (e) => {
+      this.handlers.onCoverageToggle((e.target as HTMLInputElement).checked);
+    });
+
+    (document.getElementById("show-bandwidth") as HTMLInputElement).addEventListener("change", (e) => {
+      this.handlers.onBandwidthToggle((e.target as HTMLInputElement).checked);
+    });
+
+    (document.getElementById("show-coverage-gaps") as HTMLInputElement).addEventListener("change", (e) => {
+      this.handlers.onCoverageGapsToggle((e.target as HTMLInputElement).checked);
+    });
+
+    (document.getElementById("bandwidth-layer") as HTMLSelectElement).addEventListener("change", (e) => {
+      this.handlers.onBandwidthLayerChange(
+        (e.target as HTMLSelectElement).value as "broadband" | "dtc"
+      );
+    });
+
+    const conc = document.getElementById("bandwidth-concurrency") as HTMLInputElement;
+    const concVal = document.getElementById("bandwidth-concurrency-val")!;
+    conc.addEventListener("input", () => {
+      concVal.textContent = `${conc.value}%`;
+      this.handlers.onBandwidthConcurrencyChange(Number(conc.value) / 100);
+    });
+    this.handlers.onBandwidthConcurrencyChange(Number(conc.value) / 100);
+
+    for (const id of ["bw-filter-v1", "bw-filter-v2m", "bw-filter-dtc-v1", "bw-filter-dtc-v2", "bw-filter-v3"]) {
+      document.getElementById(id)!.addEventListener("change", () => {
+        this.handlers.onBandwidthClassFilterChange();
+      });
+    }
+
+    document.getElementById("btn-coverage-timeline")!.addEventListener("click", () => {
+      const btn = document.getElementById("btn-coverage-timeline") as HTMLButtonElement;
+      const playing = btn.textContent === "Stop timeline";
+      this.handlers.onCoverageTimelineToggle(!playing);
     });
 
     (document.getElementById("auto-lod") as HTMLInputElement).addEventListener("change", (e) => {
@@ -420,6 +543,7 @@ export class ControlPanel {
 
     (document.getElementById("starlink-view") as HTMLSelectElement).addEventListener("change", (e) => {
       this.starlinkView = (e.target as HTMLSelectElement).value as StarlinkViewMode;
+      this.applyStarlinkViewMode();
       this.handlers.onStarlinkViewChange(
         this.starlinkView,
         (document.getElementById("deployment-snapshot") as HTMLSelectElement).value
@@ -440,40 +564,182 @@ export class ControlPanel {
       this.handlers.onStarlinkDeployedMasterToggle(on);
     });
 
+    (document.getElementById("starlink-gen3-master") as HTMLInputElement).addEventListener("change", (e) => {
+      const on = (e.target as HTMLInputElement).checked;
+      this.setStarlinkGen3Master(on);
+      this.handlers.onStarlinkGen3MasterToggle(on);
+    });
+
+    const minElev = document.getElementById("min-elevation") as HTMLInputElement;
+    const minElevVal = document.getElementById("min-elevation-val")!;
+    minElev.addEventListener("input", () => {
+      minElevVal.textContent = `${minElev.value}°`;
+      this.handlers.onMinElevationChange(Number(minElev.value));
+    });
+
+    (document.getElementById("night-side-dimming") as HTMLInputElement).addEventListener("change", (e) => {
+      this.handlers.onNightSideDimmingChange((e.target as HTMLInputElement).checked);
+    });
+
+    document.getElementById("btn-export-png")!.addEventListener("click", () => {
+      this.handlers.onExportScreenshot();
+    });
+
+    document.getElementById("btn-copy-share")!.addEventListener("click", () => {
+      this.handlers.onCopyShareLink();
+    });
+
+    this.buildScenarioSelect();
     this.applyStarlinkViewMode();
     this.buildDeploymentSnapshotSelect();
 
     this.buildStarlinkGen1ShellList();
     this.buildStarlinkGen2ShellList();
     this.updateGen2Inc365Visibility();
+  }
+
+  private odcShellKey(groupId: number, shellIndex: number): string {
+    return `${groupId}:${shellIndex}`;
+  }
+
+  private buildOdcGroupPanel(): void {
+    const host = document.getElementById("odc-groups")!;
+    host.innerHTML = "";
 
     for (const g of ORBIT_GROUPS) {
       const li = document.createElement("li");
+      li.className = "odc-group-item";
+
       const swatch = document.createElement("span");
       swatch.className = "swatch";
       swatch.style.background = `#${g.color.toString(16).padStart(6, "0")}`;
-      const label = document.createElement("label");
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.checked = g.id === 1;
-      cb.addEventListener("change", () => {
-        if (cb.checked) this.enabledGroups.add(g.id);
-        else this.enabledGroups.delete(g.id);
-        this.handlers.onGroupToggle(g.id, cb.checked);
+
+      const head = document.createElement("label");
+      head.className = "odc-group-head";
+      const master = document.createElement("input");
+      master.type = "checkbox";
+      master.checked = false;
+      master.addEventListener("change", () => {
+        if (master.checked) {
+          const all = new Set<number>();
+          for (let sh = 0; sh < g.shells; sh++) all.add(sh);
+          this.enabledOdcShells.set(g.id, all);
+        } else {
+          this.enabledOdcShells.delete(g.id);
+        }
+        this.syncOdcShellCheckboxes(g);
+        this.handlers.onOdcShellsChange();
         this.refreshStats();
       });
-      this.groupCheckboxes.set(g.id, cb);
-      label.appendChild(cb);
-      label.append(` ${groupLabel(g)}`);
+      this.odcGroupCheckboxes.set(g.id, master);
+      head.appendChild(master);
+      head.append(` ${g.name} · ${g.maxSats.toLocaleString()} nominal · ${g.shells} shells`);
+
       const meta = document.createElement("span");
-      meta.className = "meta";
+      meta.className = "meta odc-meta";
       meta.dataset.groupId = String(g.id);
-      label.appendChild(meta);
+      head.appendChild(meta);
+
+      const shellList = document.createElement("ul");
+      shellList.className = "odc-shell-list";
+
+      for (let sh = 0; sh < g.shells; sh++) {
+        const lo = g.altitudeKm[0];
+        const hi = g.altitudeKm[1];
+        const altKm =
+          g.shells <= 1
+            ? (lo + hi) / 2
+            : lo + ((hi - lo) * sh) / (g.shells - 1);
+        const shellLi = document.createElement("li");
+        const shellLabel = document.createElement("label");
+        const shellCb = document.createElement("input");
+        shellCb.type = "checkbox";
+        shellCb.checked = false;
+        const key = this.odcShellKey(g.id, sh);
+        shellCb.addEventListener("change", () => {
+          let set = this.enabledOdcShells.get(g.id);
+          if (!set) {
+            set = new Set();
+            this.enabledOdcShells.set(g.id, set);
+          }
+          if (shellCb.checked) set.add(sh);
+          else set.delete(sh);
+          if (set.size === 0) this.enabledOdcShells.delete(g.id);
+          this.syncOdcGroupMaster(g);
+          this.handlers.onOdcShellsChange();
+          this.refreshStats();
+        });
+        this.odcShellCheckboxes.set(key, shellCb);
+        shellLabel.appendChild(shellCb);
+        shellLabel.append(
+          ` Shell ${sh} · ~${altKm.toFixed(0)} km · ${(g.planesPerShell * g.satsPerPlane).toLocaleString()} nominal`
+        );
+        shellLi.appendChild(shellLabel);
+        shellList.appendChild(shellLi);
+      }
+
       li.appendChild(swatch);
-      li.appendChild(label);
-      document.getElementById("groups")!.appendChild(li);
+      li.appendChild(head);
+      li.appendChild(shellList);
+      host.appendChild(li);
     }
-    this.updateGroupMetas();
+    this.updateOdcGroupMetas();
+  }
+
+  private syncOdcGroupMaster(g: OrbitGroupConfig): void {
+    const master = this.odcGroupCheckboxes.get(g.id);
+    const shells = this.enabledOdcShells.get(g.id);
+    if (!master) return;
+    master.checked = !!shells && shells.size === g.shells;
+    master.indeterminate = !!shells && shells.size > 0 && shells.size < g.shells;
+  }
+
+  private syncOdcShellCheckboxes(g: OrbitGroupConfig): void {
+    const shells = this.enabledOdcShells.get(g.id) ?? new Set();
+    for (let sh = 0; sh < g.shells; sh++) {
+      const cb = this.odcShellCheckboxes.get(this.odcShellKey(g.id, sh));
+      if (cb) cb.checked = shells.has(sh);
+    }
+    this.syncOdcGroupMaster(g);
+  }
+
+  updateOdcGroupMetas(): void {
+    const model = this.getModel();
+    const divisor = model.buildParams.sampleDivisor;
+    for (const g of ORBIT_GROUPS) {
+      const meta = document.querySelector(`.odc-meta[data-group-id="${g.id}"]`)!;
+      const shells = this.enabledOdcShells.get(g.id);
+      if (!shells || shells.size === 0) {
+        meta.textContent = "";
+        continue;
+      }
+      const planes = model.planesByGroup.get(g.id) ?? [];
+      const vis = planes.reduce((n, p) => n + p.satellites.length, 0);
+      const nominalOn = shells.size * g.planesPerShell * g.satsPerPlane;
+      const gpu = model.gpuBuffers.get(g.id);
+      if (gpu) {
+        meta.textContent = ` · GPU ${gpu.displaySats.toLocaleString()} pts · 1:${divisor}`;
+      } else {
+        meta.textContent = ` · ${vis.toLocaleString()} drawn · ${nominalOn.toLocaleString()} nominal shell cap · 1:${divisor}`;
+      }
+    }
+  }
+
+  private buildScenarioSelect(): void {
+    const sel = document.getElementById("starlink-scenario") as HTMLSelectElement;
+    sel.innerHTML = "";
+    for (const s of STARLINK_SCENARIOS) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = s.label;
+      if (s.id === this.starlinkScenario) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    this.updateScenarioHint();
+    sel.addEventListener("change", (e) => {
+      const id = (e.target as HTMLSelectElement).value as StarlinkScenarioId;
+      this.handlers.onScenarioChange(id);
+    });
   }
 
   rebuildStarlinkDeployedShellList(): void {
@@ -542,6 +808,59 @@ export class ControlPanel {
     const list = document.getElementById("starlink-gen2-shells")!;
     list.innerHTML = "";
     this.buildStarlinkGen2ShellList();
+  }
+
+  rebuildStarlinkGen3ShellList(): void {
+    this.starlinkGen3Checkboxes.clear();
+    const list = document.getElementById("starlink-gen3-shells")!;
+    list.innerHTML = "";
+    this.buildStarlinkGen3ShellList();
+  }
+
+  setStarlinkGen3Master(on: boolean): void {
+    this.enabledStarlinkGen3.clear();
+    if (on) {
+      for (const g of STARLINK_GEN3_PARTIAL) this.enabledStarlinkGen3.add(g.id);
+    }
+    this.syncStarlinkGen3Checkboxes();
+  }
+
+  private syncStarlinkGen3Checkboxes(): void {
+    const master = document.getElementById("starlink-gen3-master") as HTMLInputElement;
+    master.checked =
+      STARLINK_GEN3_PARTIAL.length > 0 &&
+      STARLINK_GEN3_PARTIAL.every((g) => this.enabledStarlinkGen3.has(g.id));
+    for (const g of STARLINK_GEN3_PARTIAL) {
+      const cb = this.starlinkGen3Checkboxes.get(g.id);
+      if (cb) cb.checked = this.enabledStarlinkGen3.has(g.id);
+    }
+  }
+
+  private buildStarlinkGen3ShellList(): void {
+    const list = document.getElementById("starlink-gen3-shells")!;
+    for (const g of STARLINK_GEN3_PARTIAL) {
+      const li = document.createElement("li");
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = `#${g.color.toString(16).padStart(6, "0")}`;
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = this.enabledStarlinkGen3.has(g.id);
+      cb.addEventListener("change", () => {
+        if (cb.checked) this.enabledStarlinkGen3.add(g.id);
+        else this.enabledStarlinkGen3.delete(g.id);
+        this.syncStarlinkGen3Checkboxes();
+        this.handlers.onStarlinkGen3ShellToggle(g.id, cb.checked);
+        this.refreshStats();
+      });
+      this.starlinkGen3Checkboxes.set(g.id, cb);
+      label.appendChild(cb);
+      label.append(` ${starlinkGen3ShellLabel(g)}`);
+      li.appendChild(swatch);
+      li.appendChild(label);
+      list.appendChild(li);
+    }
   }
 
   private setStarlinkMaster(on: boolean): void {
@@ -641,37 +960,16 @@ export class ControlPanel {
     }
   }
 
-  updateGroupMetas(): void {
-    const model = this.getModel();
-    for (const g of ORBIT_GROUPS) {
-      const meta = document.querySelector(`.meta[data-group-id="${g.id}"]`)!;
-      const groupPlanes = model.planesByGroup.get(g.id)!;
-      const vis = groupPlanes.reduce((n, p) => n + p.satellites.length, 0);
-      const { planes: planeCount, nominalSats } = groupNominalBreakdown(g);
-      meta.textContent = isPolarGroup(g)
-        ? `${g.shells} shells · ${g.planesPerShell} planes/shell · ${planeCount.toLocaleString()} planes · ${nominalSats.toLocaleString()} nominal (${g.satsPerPlane.toLocaleString()}/plane)`
-        : `${g.shells} shells · ${planeCount.toLocaleString()} planes · ${vis.toLocaleString()} drawn / ${nominalSats.toLocaleString()} nominal`;
+  private ensureOdcShellEnabled(g: OrbitGroupConfig, sh: number): void {
+    let set = this.enabledOdcShells.get(g.id);
+    if (!set) {
+      set = new Set();
+      this.enabledOdcShells.set(g.id, set);
     }
-  }
-
-  private syncGroupCheckboxes(): void {
-    for (const g of ORBIT_GROUPS) {
-      this.groupCheckboxes.get(g.id)!.checked = this.enabledGroups.has(g.id);
-    }
-  }
-
-  private syncIntroUI(): void {
-    const btn = document.getElementById("btn-intro-next") as HTMLButtonElement;
-    if (this.introStep >= ORBIT_GROUPS.length) {
-      btn.disabled = true;
-      btn.textContent = "All groups shown";
-      this.introStatusEl.textContent = `Intro complete — all ${ORBIT_GROUPS.length} groups visible.`;
-    } else {
-      btn.disabled = false;
-      const next = ORBIT_GROUPS[this.introStep]!;
-      btn.textContent = `Add Group ${next.id}`;
-      this.introStatusEl.textContent = `Showing groups 1–${this.introStep}. Next: ${groupLabel(next)}`;
-    }
+    if (set.has(sh)) return;
+    set.add(sh);
+    this.syncOdcShellCheckboxes(g);
+    this.handlers.onOdcShellsChange();
   }
 
   private buildInspector(): void {
@@ -681,7 +979,10 @@ export class ControlPanel {
     clearBtn.className = "btn-secondary";
     clearBtn.textContent = "Clear selection";
     clearBtn.addEventListener("click", () => {
+      this.focusedShells.clear();
+      this.handlers.onShellFocusChange([]);
       this.handlers.onPlaneSelect(null, false);
+      this.syncShellSelectUi();
       this.inspectorEl.querySelectorAll(".plane-btn.selected").forEach((el) => el.classList.remove("selected"));
     });
     this.inspectorEl.appendChild(clearBtn);
@@ -711,13 +1012,53 @@ export class ControlPanel {
       this.inspectorEl.querySelectorAll(".plane-btn.selected").forEach((el) => el.classList.remove("selected"));
       highlight.classList.add("selected");
     }
-    if (!this.enabledGroups.has(g.id)) {
-      this.enabledGroups.add(g.id);
-      this.syncGroupCheckboxes();
-      this.handlers.onGroupToggle(g.id, true);
+    if (!this.enabledOdcShells.get(g.id)?.has(sh)) {
+      this.ensureOdcShellEnabled(g, sh);
     }
+    this.focusedShells.clear();
+    this.focusedShells.add(shellSelectionKey({ groupId: g.id, shellIndex: sh }));
+    this.handlers.onShellFocusChange([{ groupId: g.id, shellIndex: sh }]);
+    this.syncShellSelectUi();
     const isolate = (document.getElementById("isolate-plane") as HTMLInputElement).checked;
     this.handlers.onPlaneSelect({ groupId: g.id, shellIndex: sh, planeIndex: pl }, isolate);
+    this.refreshStats();
+  }
+
+  private syncShellSelectUi(): void {
+    for (const btn of this.inspectorEl.querySelectorAll<HTMLButtonElement>(".shell-select-btn")) {
+      const groupId = Number(btn.dataset.groupId);
+      const shellIndex = Number(btn.dataset.shellIndex);
+      const key = shellSelectionKey({ groupId, shellIndex });
+      const selected = this.focusedShells.has(key);
+      btn.classList.toggle("selected", selected);
+      btn.textContent = selected ? "Selected" : "Select shell";
+      btn.closest(".inspector-shell")?.classList.toggle("selected", selected);
+    }
+  }
+
+  private toggleShellSelection(g: OrbitGroupConfig, sh: number): void {
+    const key = shellSelectionKey({ groupId: g.id, shellIndex: sh });
+    if (this.focusedShells.has(key)) {
+      this.focusedShells.delete(key);
+    } else {
+      this.focusedShells.add(key);
+      if (!this.enabledOdcShells.get(g.id)?.has(sh)) {
+        this.ensureOdcShellEnabled(g, sh);
+      }
+    }
+
+    const shells = [...this.focusedShells].map((k) => {
+      const [groupId, shellIndex] = k.split(":").map(Number);
+      return { groupId: groupId!, shellIndex: shellIndex! };
+    });
+
+    if (shells.length > 0) {
+      (document.getElementById("track-mode") as HTMLSelectElement).value = "shell";
+      this.handlers.onTrackMode("shell");
+    }
+
+    this.handlers.onShellFocusChange(shells);
+    this.syncShellSelectUi();
     this.refreshStats();
   }
 
@@ -725,6 +1066,9 @@ export class ControlPanel {
     for (let sh = 0; sh < g.shells; sh++) {
       const sDetails = document.createElement("details");
       sDetails.className = "inspector-shell";
+      const key = shellSelectionKey({ groupId: g.id, shellIndex: sh });
+      if (this.focusedShells.has(key)) sDetails.classList.add("selected");
+
       const lo = g.altitudeKm[0];
       const hi = g.altitudeKm[1];
       const alt =
@@ -739,19 +1083,15 @@ export class ControlPanel {
       shellActions.className = "shell-actions";
       const shellBtn = document.createElement("button");
       shellBtn.type = "button";
-      shellBtn.className = "btn-secondary";
-      shellBtn.textContent = "Tracks: this shell only";
+      shellBtn.className = "btn-secondary shell-select-btn";
+      shellBtn.dataset.groupId = String(g.id);
+      shellBtn.dataset.shellIndex = String(sh);
+      const selected = this.focusedShells.has(key);
+      shellBtn.textContent = selected ? "Selected" : "Select shell";
+      if (selected) shellBtn.classList.add("selected");
       shellBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        if (!this.enabledGroups.has(g.id)) {
-          this.enabledGroups.add(g.id);
-          this.syncGroupCheckboxes();
-          this.handlers.onGroupToggle(g.id, true);
-        }
-        (document.getElementById("track-mode") as HTMLSelectElement).value = "shell";
-        this.handlers.onTrackMode("shell");
-        this.handlers.onShellFocus({ groupId: g.id, shellIndex: sh });
-        this.refreshStats();
+        this.toggleShellSelection(g, sh);
       });
       shellActions.appendChild(shellBtn);
       sDetails.appendChild(shellActions);
@@ -811,4 +1151,4 @@ export class ControlPanel {
   }
 }
 
-export { DENSITY_PRESETS, type BuildParams, type DensityPreset };
+export { DENSITY_STEPS, type BuildParams };

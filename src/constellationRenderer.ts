@@ -9,6 +9,10 @@ import { OdcGpuSatLayer, cameraSceneDistance } from "./render/odcGpuSats";
 import { createPerShellBandGroup } from "./render/shellThicknessBands";
 import { createShellBandGroup } from "./render/shellBands";
 import { orbitRingPoints, planeKey, positionOnPlane, type OrbitalPlane } from "./orbits";
+import {
+  resolveGpuPointScale,
+  resolveInstancedSatRadius,
+} from "./orbits";
 
 export type TrackMode = "all" | "shell" | "selected";
 
@@ -23,6 +27,10 @@ export interface ShellSelection {
   shellIndex: number;
 }
 
+export function shellSelectionKey(sel: ShellSelection): string {
+  return `${sel.groupId}:${sel.shellIndex}`;
+}
+
 export interface SlotRef {
   plane: OrbitalPlane;
   satIndex: number;
@@ -33,8 +41,6 @@ interface TrackEntry {
   line: THREE.Line;
   baseOpacity: number;
 }
-
-const DEFAULT_SAT_RADIUS = 0.008;
 
 export class ConstellationRenderer {
   readonly groupMeshes = new Map<number, THREE.InstancedMesh>();
@@ -52,8 +58,9 @@ export class ConstellationRenderer {
   private builtGroups = new Set<number>();
   private enabledGroups = new Set<number>();
   private selection: PlaneSelection | null = null;
-  private focusShell: ShellSelection | null = null;
+  private focusShells = new Set<string>();
   private isolateSelection = false;
+  private isolateShells = false;
   private showTracks = true;
   private showGroundTracks = true;
   private showShellBands = true;
@@ -103,12 +110,14 @@ export class ConstellationRenderer {
     return this.model.groups.find((g) => g.id === groupId);
   }
 
-  private satGeometryFor(g: OrbitGroupConfig): THREE.SphereGeometry {
-    let geo = this.satGeometries.get(g.id);
+  private satGeometryFor(g: OrbitGroupConfig, visibleSats: number): THREE.SphereGeometry {
+    const userScale = this.model.buildParams.satPointScale ?? 1;
+    const r = resolveInstancedSatRadius(visibleSats, userScale, g.satScale ?? 1);
+    const cacheKey = g.id + r * 1e9;
+    let geo = this.satGeometries.get(cacheKey);
     if (!geo) {
-      const r = DEFAULT_SAT_RADIUS * (g.satScale ?? 1);
       geo = new THREE.SphereGeometry(r, 6, 4);
-      this.satGeometries.set(g.id, geo);
+      this.satGeometries.set(cacheKey, geo);
     }
     return geo;
   }
@@ -172,7 +181,10 @@ export class ConstellationRenderer {
     const gpuBuf = this.model.gpuBuffers.get(groupId);
 
     if (gpuBuf) {
-      const layer = new OdcGpuSatLayer(gpuBuf, g.color, isPolarGroup(g) ? 1.4 : 1.0);
+      const vis = gpuBuf.displaySats;
+      const userScale = this.model.buildParams.satPointScale ?? 1;
+      const ptScale = resolveGpuPointScale(vis, userScale, isPolarGroup(g) ? 1.4 : 1);
+      const layer = new OdcGpuSatLayer(gpuBuf, g.color, ptScale);
       this.groupGpuLayers.set(groupId, layer);
       this.scene.add(layer.mesh);
       this.slotIndexByGroup.set(groupId, []);
@@ -185,9 +197,14 @@ export class ConstellationRenderer {
       }
       this.slotIndexByGroup.set(groupId, slots);
 
+      const visCount = planes.reduce((n, p) => n + p.satellites.length, 0);
       const mesh = new THREE.InstancedMesh(
-        this.satGeometryFor(g),
-        new THREE.MeshBasicMaterial({ color: g.color }),
+        this.satGeometryFor(g, visCount),
+        new THREE.MeshBasicMaterial({
+          color: g.color,
+          transparent: g.future === true,
+          opacity: g.future ? 0.45 : 1,
+        }),
         Math.max(slots.length, 1)
       );
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -199,18 +216,32 @@ export class ConstellationRenderer {
     const trackOpacity = g.trackOpacity ?? (gpuBuf ? 0.08 : 0.18);
     const trackGroup = new THREE.Group();
     const trackSegments = g.layer.startsWith("starlink") ? 48 : gpuBuf ? 48 : 64;
+    const isFuture = g.future === true;
 
     for (const plane of planes) {
       if (!this.shouldBuildTrack(plane, g)) continue;
       const pts = orbitRingPoints(plane, trackSegments);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(pts, 3));
-      const mat = new THREE.LineBasicMaterial({
-        color: g.color,
-        transparent: true,
-        opacity: trackOpacity,
-      });
-      const line = new THREE.Line(geo, mat);
+      let line: THREE.Line;
+      if (isFuture) {
+        const mat = new THREE.LineDashedMaterial({
+          color: g.color,
+          transparent: true,
+          opacity: trackOpacity * 0.85,
+          dashSize: 0.04,
+          gapSize: 0.025,
+        });
+        line = new THREE.Line(geo, mat);
+        line.computeLineDistances();
+      } else {
+        const mat = new THREE.LineBasicMaterial({
+          color: g.color,
+          transparent: true,
+          opacity: trackOpacity,
+        });
+        line = new THREE.Line(geo, mat);
+      }
       trackGroup.add(line);
       this.trackByKey.set(planeKey(plane.groupId, plane.shellIndex, plane.planeIndex), {
         plane,
@@ -261,9 +292,24 @@ export class ConstellationRenderer {
     this.applyVisibility();
   }
 
-  setFocusShell(shell: ShellSelection | null): void {
-    this.focusShell = shell;
-    if (shell) this.buildGroup(shell.groupId);
+  setFocusShells(shells: ShellSelection[]): void {
+    this.focusShells.clear();
+    for (const s of shells) {
+      this.focusShells.add(shellSelectionKey(s));
+      this.buildGroup(s.groupId);
+    }
+    this.applyVisibility();
+  }
+
+  getFocusShells(): ShellSelection[] {
+    return [...this.focusShells].map((key) => {
+      const [groupId, shellIndex] = key.split(":").map(Number);
+      return { groupId: groupId!, shellIndex: shellIndex! };
+    });
+  }
+
+  setIsolateShells(on: boolean): void {
+    this.isolateShells = on;
     this.applyVisibility();
   }
 
@@ -287,7 +333,8 @@ export class ConstellationRenderer {
     this.isolateSelection = isolate && sel !== null;
     if (sel) {
       this.buildGroup(sel.groupId);
-      this.focusShell = { groupId: sel.groupId, shellIndex: sel.shellIndex };
+      this.focusShells.clear();
+      this.focusShells.add(shellSelectionKey({ groupId: sel.groupId, shellIndex: sel.shellIndex }));
     }
     this.applyVisibility();
   }
@@ -306,25 +353,27 @@ export class ConstellationRenderer {
       );
     }
     if (this.trackMode === "shell") {
-      const shell =
-        this.focusShell ??
-        (this.selection
-          ? { groupId: this.selection.groupId, shellIndex: this.selection.shellIndex }
-          : null);
-      if (!shell) return true;
-      return plane.groupId === shell.groupId && plane.shellIndex === shell.shellIndex;
+      if (this.focusShells.size === 0) return true;
+      return this.focusShells.has(shellSelectionKey({ groupId: plane.groupId, shellIndex: plane.shellIndex }));
     }
     return true;
   }
 
   private planeVisible(plane: OrbitalPlane): boolean {
     if (!this.enabledGroups.has(plane.groupId)) return false;
-    if (!this.isolateSelection || !this.selection) return true;
-    return (
-      plane.groupId === this.selection.groupId &&
-      plane.shellIndex === this.selection.shellIndex &&
-      plane.planeIndex === this.selection.planeIndex
-    );
+    if (this.isolateSelection && this.selection) {
+      return (
+        plane.groupId === this.selection.groupId &&
+        plane.shellIndex === this.selection.shellIndex &&
+        plane.planeIndex === this.selection.planeIndex
+      );
+    }
+    if (this.isolateShells && this.focusShells.size > 0) {
+      return this.focusShells.has(
+        shellSelectionKey({ groupId: plane.groupId, shellIndex: plane.shellIndex })
+      );
+    }
+    return true;
   }
 
   private applyVisibility(): void {

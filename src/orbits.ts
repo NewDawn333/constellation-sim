@@ -7,15 +7,25 @@ const MU_EARTH = 3.986004418e14;
 
 export const KM_TO_SCENE = 1 / R_EARTH_KM;
 
-export const DENSITY_PRESETS = [1, 10, 100, 1000] as const;
-export type DensityPreset = (typeof DENSITY_PRESETS)[number];
+/** User-facing density steps (1:N display stride). */
+export const DENSITY_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000] as const;
+export type DensityPreset = (typeof DENSITY_STEPS)[number];
+/** @deprecated Use DENSITY_STEPS — kept for auto-budget stepping */
+export const DENSITY_PRESETS = DENSITY_STEPS;
 
 export interface BuildParams {
-  sampleDivisor: DensityPreset;
+  sampleDivisor: number;
   altitudeExaggeration: number;
+  /** 0 = uncapped per-plane count (ODC scale tests). */
   maxSatsPerPlaneCap: number;
   /** ODC 1M mode: GPU buffers + shader animation; planes are tracks-only. */
   odcRepresentativeMode?: boolean;
+  /** ODC: sample every Nth sat without legacy per-plane caps. */
+  odcUncappedDensity?: boolean;
+  /** If set, only build these shell indices (ODC progressive reveal). */
+  enabledShellIndices?: Set<number>;
+  /** 0 = true scale; else fraction of visual baseline (0.01 = 1%). */
+  satPointScale?: number;
   /** When true, build plane rings without along-track satellite slots. */
   tracksOnly?: boolean;
   /** Walker vs Falcon 9 launch-train clustering. */
@@ -31,8 +41,76 @@ export const DEFAULT_BUILD_PARAMS: BuildParams = {
   altitudeExaggeration: 1,
   maxSatsPerPlaneCap: 32,
   odcRepresentativeMode: false,
+  odcUncappedDensity: false,
+  satPointScale: 1,
   tracksOnly: false,
 };
+
+export function densityStepIndex(divisor: number): number {
+  let best = 0;
+  for (let i = 0; i < DENSITY_STEPS.length; i++) {
+    if (DENSITY_STEPS[i]! <= divisor) best = i;
+  }
+  return best;
+}
+
+export function formatDensityLabel(divisor: number): string {
+  return divisor <= 1 ? "1:1 (every sat)" : `1:${divisor.toLocaleString()}`;
+}
+
+/** Scene radius for the default visible dot (not physical). */
+export const VISUAL_SAT_BASE_RADIUS = 0.008;
+
+/** Characteristic bus radius for true-scale display (~3 m Starlink-class). */
+export const PHYSICAL_SAT_RADIUS_M = 1.5;
+
+export function physicalSatRadiusScene(radiusM = PHYSICAL_SAT_RADIUS_M): number {
+  return radiusM / 1000 / R_EARTH_KM;
+}
+
+/** Shrink dots as visible count grows (× user scale). */
+export function autoSatPointScale(visibleSats: number, userScale = 1): number {
+  const ref = 500;
+  const auto = visibleSats <= ref ? 1 : Math.sqrt(ref / visibleSats);
+  return userScale * Math.max(0.06, Math.min(1, auto));
+}
+
+/**
+ * Instanced sphere radius. satPointScale: 0 = true physical size; else % of visual baseline.
+ */
+export function resolveInstancedSatRadius(
+  visibleSats: number,
+  satPointScale: number,
+  groupSatScale = 1
+): number {
+  if (satPointScale === 0) {
+    return physicalSatRadiusScene() * groupSatScale;
+  }
+  return VISUAL_SAT_BASE_RADIUS * groupSatScale * autoSatPointScale(visibleSats, satPointScale);
+}
+
+/** GPU point-cloud scale. satPointScale: 0 = true physical size. */
+export function resolveGpuPointScale(
+  visibleSats: number,
+  satPointScale: number,
+  polarBoost = 1
+): number {
+  if (satPointScale === 0) {
+    return polarBoost * (physicalSatRadiusScene() / VISUAL_SAT_BASE_RADIUS);
+  }
+  return polarBoost * autoSatPointScale(visibleSats, satPointScale);
+}
+
+export function formatSatSizeLabel(sliderValue: number): string {
+  if (sliderValue === 0) return "True scale (~3 m)";
+  return `${sliderValue}%`;
+}
+
+/** Slider 0 = true scale; 1–200 = percent of visual baseline. */
+export function satSizeSliderToScale(sliderValue: number): number {
+  if (sliderValue === 0) return 0;
+  return sliderValue / 100;
+}
 
 export interface OrbitalPlane {
   groupId: number;
@@ -91,7 +169,11 @@ function effectiveAltitudeKm(
 
 export function visualSatsPerPlane(nominal: number, params: BuildParams): number {
   const { sampleDivisor, maxSatsPerPlaneCap } = params;
-  if (sampleDivisor <= 1) return Math.min(nominal, maxSatsPerPlaneCap);
+  const uncapped = params.odcUncappedDensity || maxSatsPerPlaneCap === 0;
+
+  if (sampleDivisor <= 1) {
+    return uncapped ? nominal : Math.min(nominal, maxSatsPerPlaneCap);
+  }
 
   if (params.satLayout === "launch_train") {
     // Show enough dots to read a filled ring (not 2 sats at 1:100 leaving half the track empty).
@@ -104,8 +186,9 @@ export function visualSatsPerPlane(nominal: number, params: BuildParams): number
   }
 
   const sampled = Math.ceil(nominal / sampleDivisor);
-  const maxVis =
-    sampleDivisor >= 1000 ? 4 : sampleDivisor >= 100 ? 8 : 16;
+  if (uncapped) return Math.max(1, Math.min(nominal, sampled));
+
+  const maxVis = sampleDivisor >= 1000 ? 4 : sampleDivisor >= 100 ? 8 : 16;
   return Math.max(2, Math.min(maxVis, sampled, nominal));
 }
 
@@ -149,6 +232,8 @@ export function buildOrbitalPlanes(
   const planes: OrbitalPlane[] = [];
 
   for (let sh = 0; sh < shells; sh++) {
+    if (params.enabledShellIndices && !params.enabledShellIndices.has(sh)) continue;
+
     const { physical, visual } = effectiveAltitudeKm(lo, hi, sh, shells, params.altitudeExaggeration);
     const incDeg = shellInclinationDeg(inclinationDeg, sh, shells);
     const incRad = (incDeg * Math.PI) / 180;

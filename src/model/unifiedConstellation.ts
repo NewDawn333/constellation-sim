@@ -37,9 +37,15 @@ export interface UnifiedConstellation {
   gpuBuffers: Map<number, RepresentativeSatBuffer>;
 }
 
+export interface OdcBuildOptions {
+  /** groupId → enabled shell indices. Omitted shells are not built. */
+  enabledShellsByGroup?: Map<number, Set<number>>;
+}
+
 export function buildUnifiedConstellation(
   groups: OrbitGroupConfig[],
-  params: BuildParams = DEFAULT_BUILD_PARAMS
+  params: BuildParams = DEFAULT_BUILD_PARAMS,
+  odcOptions: OdcBuildOptions = {}
 ): UnifiedConstellation {
   const layers: ConstellationLayerEntry[] = [];
   const planes: OrbitalPlane[] = [];
@@ -48,15 +54,40 @@ export function buildUnifiedConstellation(
   const gpuBuffers = new Map<number, RepresentativeSatBuffer>();
 
   for (const g of groups) {
+    const shellFilterProvided = odcOptions.enabledShellsByGroup !== undefined;
+    const odcShells =
+      g.layer === "odc" && shellFilterProvided
+        ? odcOptions.enabledShellsByGroup!.get(g.id)
+        : undefined;
+    if (g.layer === "odc" && shellFilterProvided && (!odcShells || odcShells.size === 0)) {
+      planesByGroup.set(g.id, []);
+      shellsByGroup.set(g.id, []);
+      layers.push({ config: g, shells: [] });
+      continue;
+    }
+
     const planeParams: BuildParams =
       g.layer === "odc" && params.odcRepresentativeMode
-        ? { ...params, tracksOnly: true }
-        : {
+        ? {
             ...params,
-            satLayout: g.satLayout,
-            launchTrainSize: g.launchTrainSize,
-            totalSats: g.maxSats,
-          };
+            tracksOnly: true,
+            odcUncappedDensity: true,
+            maxSatsPerPlaneCap: 0,
+            enabledShellIndices: odcShells,
+          }
+        : g.layer === "odc"
+          ? {
+              ...params,
+              odcUncappedDensity: true,
+              maxSatsPerPlaneCap: 0,
+              enabledShellIndices: odcShells,
+            }
+          : {
+              ...params,
+              satLayout: g.satLayout,
+              launchTrainSize: g.launchTrainSize,
+              totalSats: g.maxSats,
+            };
 
     const groupPlanes = buildOrbitalPlanes(
       g.id,
@@ -70,8 +101,16 @@ export function buildUnifiedConstellation(
     planesByGroup.set(g.id, groupPlanes);
     planes.push(...groupPlanes);
 
-    if (g.layer === "odc" && params.odcRepresentativeMode) {
-      gpuBuffers.set(g.id, buildRepresentativeSatBuffer(g, params));
+    if (g.layer === "odc" && params.odcRepresentativeMode && (!shellFilterProvided || (odcShells && odcShells.size > 0))) {
+      gpuBuffers.set(
+        g.id,
+        buildRepresentativeSatBuffer(g, {
+          ...params,
+          odcUncappedDensity: true,
+          maxSatsPerPlaneCap: 0,
+          enabledShellIndices: odcShells,
+        })
+      );
     }
 
     const shells: ConstellationShell[] = [];
@@ -101,9 +140,14 @@ export function buildConstellationModel(
   odcGroups: OrbitGroupConfig[] = ORBIT_GROUPS,
   starlinkGen1Groups: OrbitGroupConfig[] = [],
   starlinkGen2Groups: OrbitGroupConfig[] = [],
-  params: BuildParams = DEFAULT_BUILD_PARAMS
+  params: BuildParams = DEFAULT_BUILD_PARAMS,
+  odcOptions: OdcBuildOptions = {}
 ): UnifiedConstellation {
-  return buildUnifiedConstellation([...odcGroups, ...starlinkGen1Groups, ...starlinkGen2Groups], params);
+  return buildUnifiedConstellation(
+    [...odcGroups, ...starlinkGen1Groups, ...starlinkGen2Groups],
+    params,
+    odcOptions
+  );
 }
 
 export interface LayerStats {

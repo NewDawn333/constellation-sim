@@ -95,6 +95,38 @@ body,
   margin-bottom: 8px;
 }
 
+.subsection-title {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6e7d96;
+  margin: 12px 0 6px;
+}
+
+.filter-fieldset {
+  border: 1px solid rgba(120, 160, 220, 0.15);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 0.74rem;
+}
+
+.filter-fieldset legend {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6e7d96;
+  padding: 0 4px;
+}
+
+.bandwidth-readout {
+  min-height: 1.2em;
+  color: #9ec8ff;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
 .controls {
   display: flex;
   flex-direction: column;
@@ -237,6 +269,15 @@ button {
   color: #7a8aa8;
 }
 
+.inspector-shell.selected summary {
+  color: #9ec4ff;
+}
+
+.shell-select-btn.selected {
+  background: #2a5088;
+  border-color: #6a9fff;
+}
+
 .plane-row {
   display: flex;
   flex-wrap: wrap;
@@ -318,6 +359,35 @@ button {
 .inspector > .btn-secondary {
   width: 100%;
   margin-bottom: 8px;
+}
+
+.odc-group-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.odc-group-item {
+  margin-bottom: 10px;
+}
+
+.odc-group-head {
+  display: block;
+  font-size: 0.72rem;
+  margin-bottom: 4px;
+}
+
+.odc-shell-list {
+  list-style: none;
+  padding: 0 0 0 18px;
+  margin: 0;
+  font-size: 0.65rem;
+  color: #8a9ab8;
+}
+
+.odc-shell-list label {
+  display: block;
+  padding: 1px 0;
 }
 
 .shell-actions {
