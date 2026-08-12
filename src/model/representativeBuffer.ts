@@ -103,6 +103,47 @@ export function buildRepresentativeSatBuffer(
   return { groupId: g.id, nominalSats, displaySats, sampleDivisor: divisor, elements };
 }
 
+export interface ShellSlotAttributes {
+  shellIndex: Float32Array;
+  nominalSlot: Float32Array;
+  count: number;
+}
+
+/** GPU attributes: shell index + nominal slot within shell (matches buildRepresentativeSatBuffer order). */
+export function buildShellSlotAttributes(
+  g: OrbitGroupConfig,
+  params: BuildParams
+): { shellIndex: Float32Array; nominalSlot: Float32Array; count: number } | null {
+  const divisor = params.sampleDivisor;
+  const visPerPlane = representativeDisplaySatsPerPlane(g.satsPerPlane, divisor);
+  const enabledShells = params.enabledShellIndices;
+  let displaySats = 0;
+  for (let sh = 0; sh < g.shells; sh++) {
+    if (enabledShells && !enabledShells.has(sh)) continue;
+    displaySats += g.planesPerShell * visPerPlane;
+  }
+  if (displaySats <= 0) return null;
+
+  const shellIndex = new Float32Array(displaySats);
+  const nominalSlot = new Float32Array(displaySats);
+  const nominalStride = Math.max(1, Math.floor(g.satsPerPlane / visPerPlane));
+
+  let idx = 0;
+  for (let sh = 0; sh < g.shells; sh++) {
+    if (enabledShells && !enabledShells.has(sh)) continue;
+    for (let pl = 0; pl < g.planesPerShell; pl++) {
+      for (let s = 0; s < visPerPlane; s++) {
+        const satIdx = s * nominalStride;
+        shellIndex[idx] = sh;
+        nominalSlot[idx] = pl * g.satsPerPlane + satIdx;
+        idx++;
+      }
+    }
+  }
+
+  return { shellIndex, nominalSlot, count: displaySats };
+}
+
 /** Effective density multiplier from camera distance (far → sparser). */
 export function lodDensityMultiplier(cameraDistance: number): number {
   if (cameraDistance > 7) return 10;

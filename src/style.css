@@ -127,6 +127,64 @@ body,
   font-size: 0.72rem;
 }
 
+.odc-compute-readout {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(8, 16, 32, 0.55);
+  border: 1px solid rgba(120, 160, 220, 0.2);
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
+.odc-compute-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  color: #b8c8e0;
+}
+
+.odc-compute-row strong {
+  color: #e8f0ff;
+  font-weight: 600;
+  text-align: right;
+}
+
+.hint-inline {
+  color: #6e7d96;
+  font-weight: 400;
+  font-size: 0.68rem;
+}
+
+.odc-compute-row.cap-note strong {
+  color: #ffb347;
+}
+
+.odc-compute-groups {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(120, 160, 220, 0.15);
+}
+
+.odc-compute-section-title {
+  margin: 8px 0 4px;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6e7d96;
+}
+
+.odc-capacity-chart {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin-top: 8px;
+  border-radius: 6px;
+  background: rgba(4, 10, 22, 0.65);
+  border: 1px solid rgba(120, 160, 220, 0.15);
+}
+
 .controls {
   display: flex;
   flex-direction: column;
@@ -388,6 +446,47 @@ button {
 .odc-shell-list label {
   display: block;
   padding: 1px 0;
+}
+
+.odc-shell-launch {
+  padding: 2px 0 6px 22px;
+  font-size: 0.62rem;
+  color: #9aabc8;
+}
+
+.odc-shell-launch label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.odc-shell-launch input[type="range"] {
+  flex: 1;
+  min-width: 80px;
+}
+
+.odc-shell-launch-meta {
+  display: block;
+  margin-top: 2px;
+  color: #6e8ab0;
+  font-family: ui-monospace, monospace;
+}
+
+#odc-launch-planner label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.72rem;
+}
+
+#odc-launch-planner input[type="range"] {
+  width: 100%;
+  margin: 4px 0;
+}
+
+#odc-launch-planner input[type="number"] {
+  width: 5rem;
+  margin-left: 6px;
 }
 
 .shell-actions {

@@ -18,7 +18,7 @@ import {
   scenarioApplyHints,
   type StarlinkScenarioId,
 } from "./data/starlinkScenarios";
-import { exportCanvasPng, screenshotFilename } from "./exportScreenshot";
+import { exportCanvasPngWithOverlay, screenshotFilename } from "./exportScreenshot";
 import {
   readShareStateFromLocation,
   shareUrlFromState,
@@ -30,6 +30,11 @@ import {
   type PlaneSelection,
   type TrackMode,
 } from "./constellationRenderer";
+import { maxDeployOrdinalThroughYear } from "./model/odcDeployIndex";
+import {
+  manualDeployedByShellIndex,
+  manualLaunchActive,
+} from "./model/odcManualLaunch";
 import { createEarthScene } from "./render/earth";
 import { CoverageLayer } from "./render/coverageLayer";
 import type { HardwareClassFilter } from "./data/starlinkHardware";
@@ -81,6 +86,49 @@ async function main(): Promise<void> {
   let minElevationDeg = 25;
   let nightSideDimming = false;
   let panel!: ControlPanel;
+  let odcLaunchTrainPhase = 0;
+
+  function odcLaunchTrainOrdinalCap(): number {
+    if (!panel?.isOdcLaunchTrainEnabled() || !panel.isOdcDeploy3dEnabled()) {
+      return Number.POSITIVE_INFINITY;
+    }
+    const attrs = panel.buildOdcDisplayDeployAttributes();
+    const maxOrd = maxDeployOrdinalThroughYear(attrs, panel.getOdcSimYear());
+    if (maxOrd <= 0) return 0;
+    const t = 0.5 - 0.5 * Math.cos(odcLaunchTrainPhase * Math.PI * 2);
+    return Math.max(1, Math.floor(t * maxOrd));
+  }
+
+  function refreshManualLaunchVisual(): void {
+    if (!panel || !buildParams.odcRepresentativeMode) return;
+    const physics = panel.getOdcLaunchPhysics();
+    const launches = panel.getOdcShellLaunches();
+    const active = manualLaunchActive(launches);
+    const enabledShells = panel.getEnabledOdcShellsByGroup();
+    const states = new Map<number, { enabled: boolean; shellDeployed: Float32Array }>();
+
+    for (const g of ORBIT_GROUPS) {
+      if (!enabledShells.get(g.id)?.size) continue;
+      states.set(g.id, {
+        enabled: active,
+        shellDeployed: manualDeployedByShellIndex(g, physics, launches),
+      });
+    }
+    constellation.setAllOdcManualLaunchVisual(states);
+  }
+
+  function refreshOdcDeployVisual(): void {
+    if (!panel) return;
+    const attrs = panel.buildOdcDisplayDeployAttributes();
+    constellation.setOdcDeployAttributes(attrs);
+    const manualOn = panel.isManualLaunchActive();
+    constellation.setOdcDeploymentVisual({
+      ...panel.getOdcDeployVisualBase(),
+      enabled: panel.isOdcDeploy3dEnabled() && !manualOn,
+      deployOrdinalCap: odcLaunchTrainOrdinalCap(),
+    });
+    refreshManualLaunchVisual();
+  }
 
   function buildModel(): UnifiedConstellation {
     const starlink = starlinkGroupsForScenario(starlinkScenario, {
@@ -94,6 +142,17 @@ async function main(): Promise<void> {
     const gen2 = starlink.filter((g) => g.layer === "starlink-gen2");
     return buildConstellationModel(ORBIT_GROUPS, gen1, gen2, buildParams, {
       enabledShellsByGroup: panel?.getEnabledOdcShellsByGroup?.() ?? new Map(),
+      manualLaunch: panel?.getManualLaunchBuildOptions(),
+    });
+  }
+
+  let manualLaunchRebuildQueued = false;
+  function queueManualLaunchRebuild(): void {
+    if (manualLaunchRebuildQueued) return;
+    manualLaunchRebuildQueued = true;
+    requestAnimationFrame(() => {
+      manualLaunchRebuildQueued = false;
+      rebuildConstellation();
     });
   }
 
@@ -267,6 +326,7 @@ async function main(): Promise<void> {
       concurrencyPct: Number((document.getElementById("bandwidth-concurrency") as HTMLInputElement).value),
       minElevationDeg,
       nightSideDimming,
+      odc: panel?.getOdcShareState(),
     };
   }
 
@@ -312,6 +372,9 @@ async function main(): Promise<void> {
       coverage.setVisible(true);
     } else {
       coverage.setVisible(false);
+    }
+    if (state.odc) {
+      panel.applyOdcShareState(state.odc);
     }
     coverage.invalidate();
     updateShareHash();
@@ -410,6 +473,7 @@ async function main(): Promise<void> {
       constellation.setSelection(sel, isolate);
     }
     panel?.updateOdcGroupMetas();
+    refreshOdcDeployVisual();
     coverage.invalidate();
   }
 
@@ -474,6 +538,16 @@ async function main(): Promise<void> {
           rebuildConstellation();
           setLoader("", false);
         });
+      },
+      onOdcDeployViewChange() {
+        odcLaunchTrainPhase = 0;
+        refreshOdcDeployVisual();
+      },
+      onOdcManualLaunchChange() {
+        queueManualLaunchRebuild();
+      },
+      onOdcShareChange() {
+        updateShareHash();
       },
       onShowTracks(show) {
         constellation.setShowTracks(show);
@@ -685,8 +759,9 @@ async function main(): Promise<void> {
       },
       onExportScreenshot() {
         renderer.render(scene, camera);
-        exportCanvasPng(canvas, screenshotFilename());
-        panel.setShareStatus("PNG saved");
+        const overlay = panel.buildOdcCapacityOverlayLines();
+        exportCanvasPngWithOverlay(canvas, overlay, screenshotFilename());
+        panel.setShareStatus("PNG saved with ODC capacity readout");
       },
       onCopyShareLink() {
         updateShareHash();
@@ -760,6 +835,12 @@ async function main(): Promise<void> {
     displayedFps = fpsSamples.reduce((a, b) => a + b, 0) / fpsSamples.length;
 
     tickBudget(dt, displayedFps);
+
+    if (panel?.isOdcLaunchTrainEnabled() && panel.isOdcDeploy3dEnabled()) {
+      odcLaunchTrainPhase += dt * 0.12;
+      if (odcLaunchTrainPhase > 1) odcLaunchTrainPhase -= 1;
+      constellation.setOdcDeploymentVisual({ deployOrdinalCap: odcLaunchTrainOrdinalCap() });
+    }
 
     const drawn = constellation.updateInstances(simTime);
     if (isServiceOverlayActive()) {

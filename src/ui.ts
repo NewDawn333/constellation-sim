@@ -26,7 +26,11 @@ import {
   type StarlinkGen2Inc365,
   type StarlinkViewMode,
 } from "./constellation";
-import { STARLINK_GEN3_PARTIAL, starlinkGen3ShellLabel } from "./data/starlinkGen3";
+import {
+  STARLINK_GEN3_SYSTEM_MAX,
+  starlinkGen3GroupsForScenario,
+  starlinkGen3ShellLabel,
+} from "./data/starlinkGen3";
 import {
   STARLINK_SCENARIOS,
   scenarioApplyHints,
@@ -35,6 +39,53 @@ import {
 import type { ConstellationRenderer, PlaneSelection, ShellSelection, TrackMode } from "./constellationRenderer";
 import { shellSelectionKey } from "./constellationRenderer";
 import { DENSITY_STEPS, formatDensityLabel, formatSatSizeLabel, satSizeSliderToScale, type BuildParams } from "./orbits";
+import {
+  DEFAULT_ODC_LAUNCH_SCENARIO_ID,
+  ODC_LAUNCH_SCENARIOS,
+  expandScenarioSchedule,
+  odcLaunchScenarioById,
+  type OdcLaunchScenarioId,
+} from "./data/odcLaunchScenarios";
+import {
+  formatComputeTflops,
+  formatGw,
+  formatRubinMultiple,
+  simulateOdcDeployment,
+  snapshotAtYear,
+  type DeploymentFillOrder,
+} from "./model/odcDeployment";
+import { buildOdcCapacitySummaryText, buildOdcCapacityOverlayLines } from "./model/odcCapacitySummary";
+import {
+  capacityDeltaSincePriorYear,
+  cappedSatsThroughYear,
+  effectiveSnapshot,
+  groupEffectiveCapacities,
+  weightedSunDuty,
+} from "./model/odcSunDuty";
+import { drawOdcCapacityChart } from "./ui/odcCapacityChart";
+import {
+  buildOdcDisplayDeployAttributes,
+  globalDeployYearRange,
+  type GroupDisplayDeployAttributes,
+} from "./model/odcDeployIndex";
+import type { OdcDeployVisualState } from "./render/odcGpuSats";
+import {
+  ODC_COMPUTE_TIERS,
+  DEFAULT_COMPUTE_TIER_ID,
+  type OdcComputeTierId,
+} from "./data/odcComputeSpec";
+import type { OdcShareState } from "./shareOdcState";
+import {
+  DEFAULT_ODC_LAUNCH_PHYSICS,
+  derivedSatsPerLaunch,
+  deployedSatsForShell,
+  effectiveSatsPerLaunch,
+  manualFleetCapacity,
+  manualLaunchActive,
+  maxLaunchesForShell,
+  shellKey,
+  type OdcLaunchPhysics,
+} from "./model/odcManualLaunch";
 
 export interface SimUIHandlers {
   onDensityChange: (divisor: number) => void;
@@ -78,6 +129,9 @@ export interface SimUIHandlers {
   onCopyShareLink: () => void;
   onOdcRepresentativeModeChange: (on: boolean) => void;
   onAutoLodToggle: (on: boolean) => void;
+  onOdcDeployViewChange: () => void;
+  onOdcShareChange: () => void;
+  onOdcManualLaunchChange: () => void;
 }
 
 export class ControlPanel {
@@ -95,6 +149,17 @@ export class ControlPanel {
   private isolatePlane = false;
   private focusedShells = new Set<string>();
   private densityStepIndex = 6;
+  private odcLaunchScenario: OdcLaunchScenarioId = DEFAULT_ODC_LAUNCH_SCENARIO_ID;
+  private odcSimYear = 2035;
+  private odcFillOrder: DeploymentFillOrder = "altitude-asc";
+  private odcDeploy3d = false;
+  private odcLaunchTrain = false;
+  private odcTierOverride?: OdcComputeTierId;
+  private odcLaunchPhysics: OdcLaunchPhysics = { ...DEFAULT_ODC_LAUNCH_PHYSICS };
+  private odcShellLaunches = new Map<string, number>();
+  private odcSatsPerLaunchManual = false;
+  private readonly odcShellLaunchSliders = new Map<string, HTMLInputElement>();
+  private readonly odcShellLaunchMetas = new Map<string, HTMLElement>();
 
   private readonly statsEl: HTMLElement;
   private readonly inspectorEl: HTMLElement;
@@ -114,13 +179,36 @@ export class ControlPanel {
     this.inspectorEl = document.getElementById("inspector")!;
 
     this.wireControls();
+    this.buildOdcLaunchPlannerPanel();
     this.buildOdcGroupPanel();
+    this.buildOdcComputePanel();
     this.buildInspector();
     this.refreshStats();
   }
 
   getEnabledOdcShellsByGroup(): Map<number, Set<number>> {
     return this.enabledOdcShells;
+  }
+
+  getOdcLaunchPhysics(): OdcLaunchPhysics {
+    return { ...this.odcLaunchPhysics };
+  }
+
+  getOdcShellLaunches(): Map<string, number> {
+    return new Map(this.odcShellLaunches);
+  }
+
+  getManualLaunchBuildOptions():
+    | { physics: OdcLaunchPhysics; shellLaunches: Map<string, number> }
+    | undefined {
+    return {
+      physics: { ...this.odcLaunchPhysics },
+      shellLaunches: new Map(this.odcShellLaunches),
+    };
+  }
+
+  isManualLaunchActive(): boolean {
+    return manualLaunchActive(this.odcShellLaunches);
   }
 
   private odcEnabledGroupIds(): Set<number> {
@@ -133,6 +221,9 @@ export class ControlPanel {
 
   getEnabledGroups(): Set<number> {
     const odc = this.odcEnabledGroupIds();
+    if (this.starlinkScenario === "gen3-filing") {
+      return new Set([...odc, ...this.enabledStarlinkGen3]);
+    }
     if (this.starlinkScenario === "gen3-partial" && this.starlinkView === "operational") {
       return new Set([...odc, ...this.enabledStarlinkDeployed, ...this.enabledStarlinkGen3]);
     }
@@ -142,8 +233,145 @@ export class ControlPanel {
     return new Set([...odc, ...this.enabledStarlinkGen1, ...this.enabledStarlinkGen2]);
   }
 
-  getStarlinkScenario(): StarlinkScenarioId {
-    return this.starlinkScenario;
+  private gen3Shells(): OrbitGroupConfig[] {
+    return starlinkGen3GroupsForScenario(this.starlinkScenario);
+  }
+
+  getOdcSimYear(): number {
+    return this.odcSimYear;
+  }
+
+  isOdcLaunchTrainEnabled(): boolean {
+    return this.odcLaunchTrain;
+  }
+
+  isOdcDeploy3dEnabled(): boolean {
+    return this.odcDeploy3d;
+  }
+
+  getOdcShareState(): OdcShareState {
+    const shellLaunches: Record<string, number> = {};
+    for (const [k, v] of this.odcShellLaunches) {
+      if (v > 0) shellLaunches[k] = v;
+    }
+    return {
+      scenario: this.odcLaunchScenario,
+      year: this.odcSimYear,
+      tier: this.odcTierOverride,
+      fill: this.odcFillOrder,
+      deploy3d: this.odcDeploy3d,
+      train: this.odcLaunchTrain,
+      payloadTon: this.odcLaunchPhysics.payloadTon,
+      satMassTon: this.odcLaunchPhysics.satMassTon,
+      powerMwPerSat: this.odcLaunchPhysics.powerMwPerSat,
+      satsPerLaunch: this.odcSatsPerLaunchManual
+        ? this.odcLaunchPhysics.satsPerLaunchOverride
+        : undefined,
+      shellLaunches: Object.keys(shellLaunches).length > 0 ? shellLaunches : undefined,
+    };
+  }
+
+  applyOdcShareState(odc: OdcShareState): void {
+    this.odcLaunchScenario = odc.scenario;
+    this.odcSimYear = odc.year;
+    this.odcFillOrder = odc.fill ?? "altitude-asc";
+    this.odcTierOverride = odc.tier;
+    this.odcDeploy3d = odc.deploy3d ?? false;
+    this.odcLaunchTrain = odc.train ?? false;
+
+    (document.getElementById("odc-launch-scenario") as HTMLSelectElement).value = odc.scenario;
+    (document.getElementById("odc-fill-order") as HTMLSelectElement).value = this.odcFillOrder;
+    (document.getElementById("odc-compute-tier") as HTMLSelectElement).value =
+      this.odcTierOverride ?? "";
+    (document.getElementById("odc-deploy-3d") as HTMLInputElement).checked = this.odcDeploy3d;
+    (document.getElementById("odc-launch-train") as HTMLInputElement).checked = this.odcLaunchTrain;
+
+    this.syncOdcSimYearSlider();
+    this.updateOdcLaunchScenarioHint();
+    this.refreshOdcComputeReadout();
+    this.syncOdcDeployView();
+
+    if (odc.payloadTon != null) this.odcLaunchPhysics.payloadTon = odc.payloadTon;
+    if (odc.satMassTon != null) this.odcLaunchPhysics.satMassTon = odc.satMassTon;
+    if (odc.powerMwPerSat != null) this.odcLaunchPhysics.powerMwPerSat = odc.powerMwPerSat;
+    if (odc.satsPerLaunch != null) {
+      this.odcLaunchPhysics.satsPerLaunchOverride = odc.satsPerLaunch;
+      this.odcSatsPerLaunchManual = true;
+    } else {
+      this.odcLaunchPhysics.satsPerLaunchOverride = undefined;
+      this.odcSatsPerLaunchManual = false;
+    }
+    this.odcShellLaunches.clear();
+    if (odc.shellLaunches) {
+      for (const [k, v] of Object.entries(odc.shellLaunches)) {
+        this.odcShellLaunches.set(k, v);
+      }
+    }
+    this.syncOdcLaunchPlannerInputs();
+    this.syncAllShellLaunchSliders();
+    this.refreshManualLaunchReadout();
+    this.handlers.onOdcManualLaunchChange();
+  }
+
+  buildOdcCapacityOverlayLines(): string[] {
+    if (this.isManualLaunchActive()) {
+      return this.buildManualLaunchOverlayLines();
+    }
+    const scenario = odcLaunchScenarioById(this.odcLaunchScenario);
+    const schedule = this.expandedOdcSchedule();
+    const sim = simulateOdcDeployment(schedule, { fillOrder: this.odcFillOrder });
+    const tierLabel = this.odcTierOverride
+      ? ODC_COMPUTE_TIERS[this.odcTierOverride].label
+      : undefined;
+    return buildOdcCapacityOverlayLines(scenario, sim, this.odcSimYear, tierLabel);
+  }
+
+  buildManualLaunchOverlayLines(): string[] {
+    const fleet = this.computeManualFleetCapacity();
+    return [
+      `ODC manual launch plan · ${fleet.totalLaunches.toLocaleString()} launches`,
+      `${fleet.deployedSats.toLocaleString()} sats · ${formatGw(fleet.powerGw)} · ${formatComputeTflops(fleet.computeTflops)} (${formatRubinMultiple(fleet.rubinMultiple)})`,
+      `${effectiveSatsPerLaunch(this.odcLaunchPhysics)} sats/launch · ${this.odcLaunchPhysics.payloadTon} t payload · ${this.odcLaunchPhysics.powerMwPerSat} MW/sat`,
+    ];
+  }
+
+  computeManualFleetCapacity() {
+    return manualFleetCapacity(
+      this.odcLaunchPhysics,
+      this.odcShellLaunches,
+      this.enabledOdcShells,
+      this.odcTierOverride
+    );
+  }
+
+  private expandedOdcSchedule() {
+    const scenario = odcLaunchScenarioById(this.odcLaunchScenario);
+    return expandScenarioSchedule(scenario, { tierOverride: this.odcTierOverride });
+  }
+
+  private notifyOdcShareChange(): void {
+    this.handlers.onOdcShareChange();
+  }
+
+  buildOdcDisplayDeployAttributes(): Map<number, GroupDisplayDeployAttributes> {
+    const schedule = this.expandedOdcSchedule();
+    return buildOdcDisplayDeployAttributes(schedule, this.odcFillOrder, this.getModel().buildParams);
+  }
+
+  getOdcDeployVisualBase(): Partial<OdcDeployVisualState> {
+    const attrs = this.buildOdcDisplayDeployAttributes();
+    const { minYear, maxYear } = globalDeployYearRange(attrs);
+    return {
+      enabled: this.odcDeploy3d,
+      simYear: this.odcSimYear,
+      colorByYear: true,
+      minYear,
+      maxYear,
+    };
+  }
+
+  private syncOdcDeployView(): void {
+    this.handlers.onOdcDeployViewChange();
   }
 
   getStarlinkView(): StarlinkViewMode {
@@ -168,14 +396,21 @@ export class ControlPanel {
     const nominalPanel = document.getElementById("starlink-nominal-panel")!;
     const operationalPanel = document.getElementById("starlink-operational-panel")!;
     const snapshotRow = document.getElementById("starlink-snapshot-row")!;
-    const gen3Panel = document.getElementById("starlink-gen3-panel")!;
-    const isOp = this.starlinkView === "operational";
+    const gen3PartialPanel = document.getElementById("starlink-gen3-panel")!;
+    const gen3FilingPanel = document.getElementById("starlink-gen3-filing-panel")!;
+    const gen1Gen2Nominal = document.getElementById("starlink-gen1-gen2-nominal")!;
+    const isFiling = this.starlinkScenario === "gen3-filing";
+    const isOp = this.starlinkView === "operational" && !isFiling;
     nominalPanel.hidden = isOp;
     operationalPanel.hidden = !isOp;
     snapshotRow.hidden = !isOp;
-    gen3Panel.hidden = !(isOp && this.starlinkScenario === "gen3-partial");
+    gen3PartialPanel.hidden = !(isOp && this.starlinkScenario === "gen3-partial");
+    gen3FilingPanel.hidden = !isFiling;
+    gen1Gen2Nominal.hidden = isFiling;
     this.updateDeploymentSnapshotHint();
-    if (isOp) {
+    if (isFiling) {
+      this.rebuildStarlinkGen3ShellList();
+    } else if (isOp) {
       this.rebuildStarlinkDeployedShellList();
       if (this.starlinkScenario === "gen3-partial") {
         this.rebuildStarlinkGen3ShellList();
@@ -202,12 +437,13 @@ export class ControlPanel {
     (document.getElementById("starlink-gen2-mode") as HTMLSelectElement).value = hints.gen2Mode;
     (document.getElementById("starlink-gen2-inc365") as HTMLSelectElement).value = hints.gen2Inc365;
 
+    if (scenarioId === "gen3-filing" || scenarioId === "gen3-partial") {
+      this.setStarlinkGen3Master(true);
+    }
+
     if (hints.enableAllStarlink) {
       if (hints.view === "operational") {
         this.setStarlinkDeployedMaster(true);
-        if (scenarioId === "gen3-partial") {
-          this.setStarlinkGen3Master(true);
-        }
       } else {
         this.setStarlinkMaster(true);
         this.setStarlinkGen2Master(true);
@@ -321,7 +557,11 @@ export class ControlPanel {
   }
 
   updateStats(model: UnifiedConstellation, fps: number, drawnSats: number, budgetNote: string): void {
-    const stats = computeStats(model, this.getEnabledGroups());
+    const stats = computeStats(model, this.getEnabledGroups(), this.enabledOdcShells);
+    const gpuMode = model.buildParams.odcRepresentativeMode && model.gpuBuffers.size > 0;
+    const odcDrawnDetail = gpuMode
+      ? `${drawnSats.toLocaleString()} / ${stats.odc.visibleSats.toLocaleString()} buf · ${formatDensityLabel(model.buildParams.sampleDivisor)}`
+      : `${drawnSats.toLocaleString()} / ${stats.odc.visibleSats.toLocaleString()} · ${formatDensityLabel(model.buildParams.sampleDivisor)}`;
     const alt =
       stats.altitudeSpanKm === null
         ? "—"
@@ -335,33 +575,53 @@ export class ControlPanel {
           ? STARLINK_GEN1_NOMINAL_DEPLOYED
           : STARLINK_GEN1_NOMINAL_AUTHORIZED;
     const gen2Cap =
-      this.starlinkView === "operational" && snap
-        ? snap.gen2Total
-        : this.starlinkGen2Mode === "application"
-          ? STARLINK_GEN2_NOMINAL_APPLICATION
-          : STARLINK_GEN2_FCC_TRANCHE_CAP;
+      this.starlinkScenario === "gen3-filing"
+        ? STARLINK_GEN3_SYSTEM_MAX
+        : this.starlinkView === "operational" && snap
+          ? snap.gen2Total
+          : this.starlinkGen2Mode === "application"
+            ? STARLINK_GEN2_NOMINAL_APPLICATION
+            : STARLINK_GEN2_FCC_TRANCHE_CAP;
     const starlinkTotalCap =
-      this.starlinkView === "operational" && snap ? snap.totalOperational : gen1Cap + gen2Cap;
+      this.starlinkScenario === "gen3-filing"
+        ? STARLINK_GEN3_SYSTEM_MAX
+        : this.starlinkView === "operational" && snap
+          ? snap.totalOperational
+          : gen1Cap + gen2Cap;
     const gapNote =
       this.starlinkView === "nominal" &&
+      this.starlinkScenario !== "gen3-filing" &&
       this.enabledStarlinkGen1.size > 0 &&
       this.enabledStarlinkGen2.size > 0
         ? `<div class="stat-budget">Gen1–Gen2 gap: ${GEN1_GEN2_ALTITUDE_GAP_KM[0]}–${GEN1_GEN2_ALTITUDE_GAP_KM[1]} km</div>`
         : "";
     const starlinkModeNote =
-      this.starlinkView === "operational" && snap
-        ? `<div class="stat-budget">${snap.label} · ${snap.reconciliationMethod}</div>`
-        : "";
+      this.starlinkScenario === "gen3-filing"
+        ? `<div class="stat-budget">Gen3 as-filed · Table A.1.1 · 100k system max</div>`
+        : this.starlinkView === "operational" && snap
+          ? `<div class="stat-budget">${snap.label} · ${snap.reconciliationMethod}</div>`
+          : "";
+
+    const gen3On =
+      this.starlinkScenario === "gen3-filing" || this.starlinkScenario === "gen3-partial"
+        ? this.gen3Shells()
+            .filter((g) => this.enabledStarlinkGen3.has(g.id))
+            .reduce((n, g) => n + g.maxSats, 0)
+        : 0;
+    const starlinkGenRows =
+      this.starlinkScenario === "gen3-filing"
+        ? `<div class="stat-row"><span>Starlink Gen3 (on)</span><strong>${gen3On.toLocaleString()} / ${STARLINK_GEN3_SYSTEM_MAX.toLocaleString()}</strong></div>`
+        : `<div class="stat-row"><span>Starlink Gen1 (on)</span><strong>${stats.starlinkGen1.nominalSats.toLocaleString()} / ${gen1Cap.toLocaleString()}</strong></div>
+      <div class="stat-row"><span>Starlink Gen2 (on)</span><strong>${stats.starlinkGen2.nominalSats.toLocaleString()} / ${gen2Cap.toLocaleString()}</strong></div>
+      <div class="stat-row"><span>Starlink total (on)</span><strong>${(stats.starlinkGen1.nominalSats + stats.starlinkGen2.nominalSats).toLocaleString()} / ${starlinkTotalCap.toLocaleString()}</strong></div>`;
 
     this.statsEl.innerHTML = `
-      <div class="stat-row"><span>ODC drawn</span><strong>${drawnSats.toLocaleString()} / ${stats.odc.visibleSats.toLocaleString()} buf · ${formatDensityLabel(model.buildParams.sampleDivisor)}</strong></div>
+      <div class="stat-row"><span>ODC drawn</span><strong>${odcDrawnDetail}</strong></div>
       <div class="stat-row"><span>ODC nominal (on)</span><strong>${stats.odc.nominalSats.toLocaleString()} / ${ODC_NOMINAL_TOTAL.toLocaleString()}</strong></div>
       <div class="stat-row"><span>ODC polar (on)</span><strong>${stats.odcPolar.nominalSats.toLocaleString()} / ${ODC_POLAR_NOMINAL_TOTAL.toLocaleString()}</strong></div>
       <div class="stat-row"><span>ODC inclined (on)</span><strong>${stats.odcInclined.nominalSats.toLocaleString()} / ${ODC_INCLINED_NOMINAL_TOTAL.toLocaleString()}</strong></div>
       ${this.getRepresentativeStatRow()}
-      <div class="stat-row"><span>Starlink Gen1 (on)</span><strong>${stats.starlinkGen1.nominalSats.toLocaleString()} / ${gen1Cap.toLocaleString()}</strong></div>
-      <div class="stat-row"><span>Starlink Gen2 (on)</span><strong>${stats.starlinkGen2.nominalSats.toLocaleString()} / ${gen2Cap.toLocaleString()}</strong></div>
-      <div class="stat-row"><span>Starlink total (on)</span><strong>${(stats.starlinkGen1.nominalSats + stats.starlinkGen2.nominalSats).toLocaleString()} / ${starlinkTotalCap.toLocaleString()}</strong></div>
+      ${starlinkGenRows}
       <div class="stat-row"><span>Groups</span><strong>${stats.enabledGroups}</strong></div>
       <div class="stat-row"><span>Planes</span><strong>${stats.totalPlanes.toLocaleString()}</strong></div>
       <div class="stat-row"><span>Sats in model</span><strong>${stats.visibleSats.toLocaleString()}</strong></div>
@@ -374,7 +634,7 @@ export class ControlPanel {
   }
 
   refreshStats(): void {
-    void computeStats(this.getModel(), this.getEnabledGroups());
+    void computeStats(this.getModel(), this.getEnabledGroups(), this.enabledOdcShells);
   }
 
   private getRepresentativeStatRow(): string {
@@ -570,6 +830,15 @@ export class ControlPanel {
       this.handlers.onStarlinkGen3MasterToggle(on);
     });
 
+    (document.getElementById("starlink-gen3-filing-master") as HTMLInputElement).addEventListener(
+      "change",
+      (e) => {
+        const on = (e.target as HTMLInputElement).checked;
+        this.setStarlinkGen3Master(on);
+        this.handlers.onStarlinkGen3MasterToggle(on);
+      }
+    );
+
     const minElev = document.getElementById("min-elevation") as HTMLInputElement;
     const minElevVal = document.getElementById("min-elevation-val")!;
     minElev.addEventListener("input", () => {
@@ -599,8 +868,152 @@ export class ControlPanel {
   }
 
   private odcShellKey(groupId: number, shellIndex: number): string {
-    return `${groupId}:${shellIndex}`;
+    return shellKey(groupId, shellIndex);
   }
+
+  private buildOdcLaunchPlannerPanel(): void {
+    this.syncOdcLaunchPlannerInputs();
+    this.wireOdcLaunchPlannerControls();
+    this.refreshManualLaunchReadout();
+  }
+
+  private wireOdcLaunchPlannerControls(): void {
+    const payload = document.getElementById("odc-payload-ton") as HTMLInputElement;
+    payload.addEventListener("input", () => {
+      this.odcLaunchPhysics.payloadTon = Number(payload.value);
+      this.syncOdcLaunchPlannerInputs();
+      this.syncAllShellLaunchSliders();
+      this.refreshManualLaunchReadout();
+      this.notifyManualLaunchChange();
+    });
+
+    const mass = document.getElementById("odc-sat-mass-ton") as HTMLInputElement;
+    mass.addEventListener("change", () => {
+      this.odcLaunchPhysics.satMassTon = Math.max(0.1, Number(mass.value) || 0.1);
+      if (!this.odcSatsPerLaunchManual) this.syncDerivedSatsPerLaunch();
+      this.syncAllShellLaunchSliders();
+      this.refreshManualLaunchReadout();
+      this.notifyManualLaunchChange();
+    });
+
+    const power = document.getElementById("odc-power-mw") as HTMLInputElement;
+    power.addEventListener("change", () => {
+      this.odcLaunchPhysics.powerMwPerSat = Math.max(0.01, Number(power.value) || 0.01);
+      this.refreshManualLaunchReadout();
+      this.notifyManualLaunchChange();
+    });
+
+    const spsl = document.getElementById("odc-sats-per-launch") as HTMLInputElement;
+    spsl.addEventListener("change", () => {
+      const v = Math.max(1, Math.floor(Number(spsl.value) || 1));
+      this.odcSatsPerLaunchManual = true;
+      this.odcLaunchPhysics.satsPerLaunchOverride = v;
+      spsl.value = String(v);
+      this.syncAllShellLaunchSliders();
+      this.refreshManualLaunchReadout();
+      this.notifyManualLaunchChange();
+    });
+  }
+
+  private syncOdcLaunchPlannerInputs(): void {
+    const payload = document.getElementById("odc-payload-ton") as HTMLInputElement;
+    const payloadVal = document.getElementById("odc-payload-ton-val")!;
+    payload.value = String(this.odcLaunchPhysics.payloadTon);
+    payloadVal.textContent = `${this.odcLaunchPhysics.payloadTon} t`;
+
+    (document.getElementById("odc-sat-mass-ton") as HTMLInputElement).value = String(
+      this.odcLaunchPhysics.satMassTon
+    );
+    (document.getElementById("odc-power-mw") as HTMLInputElement).value = String(
+      this.odcLaunchPhysics.powerMwPerSat
+    );
+
+    this.syncDerivedSatsPerLaunch();
+  }
+
+  private syncDerivedSatsPerLaunch(): void {
+    const derived = derivedSatsPerLaunch(this.odcLaunchPhysics);
+    (document.getElementById("odc-sats-per-launch-derived") as HTMLElement).textContent = String(derived);
+    const spsl = document.getElementById("odc-sats-per-launch") as HTMLInputElement;
+    if (!this.odcSatsPerLaunchManual) {
+      this.odcLaunchPhysics.satsPerLaunchOverride = undefined;
+      spsl.value = String(Math.max(1, derived));
+    } else if (this.odcLaunchPhysics.satsPerLaunchOverride != null) {
+      spsl.value = String(this.odcLaunchPhysics.satsPerLaunchOverride);
+    }
+  }
+
+  private syncAllShellLaunchSliders(): void {
+    for (const g of ORBIT_GROUPS) {
+      for (let sh = 0; sh < g.shells; sh++) {
+        this.syncShellLaunchSlider(g, sh);
+      }
+    }
+  }
+
+  private syncShellLaunchSlider(g: OrbitGroupConfig, shellIndex: number): void {
+    const key = this.odcShellKey(g.id, shellIndex);
+    const slider = this.odcShellLaunchSliders.get(key);
+    if (!slider) return;
+    const spsl = effectiveSatsPerLaunch(this.odcLaunchPhysics);
+    const max = Math.max(1, maxLaunchesForShell(g, spsl));
+    slider.max = String(max);
+    const launches = this.odcShellLaunches.get(key) ?? 0;
+    slider.value = String(Math.min(launches, max));
+    this.refreshShellLaunchMeta(g, shellIndex);
+  }
+
+  private refreshShellLaunchMeta(g: OrbitGroupConfig, shellIndex: number): void {
+    const key = this.odcShellKey(g.id, shellIndex);
+    const meta = this.odcShellLaunchMetas.get(key);
+    const valEl = document.querySelector(`.odc-shell-launch-val[data-shell-key="${key}"]`) as HTMLElement;
+    const launches = this.odcShellLaunches.get(key) ?? 0;
+    const spsl = effectiveSatsPerLaunch(this.odcLaunchPhysics);
+    const deployed = deployedSatsForShell(g, launches, spsl);
+    const powerMw = deployed * this.odcLaunchPhysics.powerMwPerSat;
+    const tierId = this.odcTierOverride ?? DEFAULT_COMPUTE_TIER_ID;
+    const tier = ODC_COMPUTE_TIERS[tierId];
+    const perSatTflops =
+      (tier.tflopsPerSat * (this.odcLaunchPhysics.powerMwPerSat * 1000)) / tier.kwPerSat;
+    const compute = formatComputeTflops(deployed * perSatTflops);
+    if (valEl) valEl.textContent = String(launches);
+    if (meta) {
+      meta.textContent =
+        launches > 0
+          ? `→ ${deployed.toLocaleString()} sats · ${powerMw.toFixed(1)} MW · ${compute}`
+          : "→ 0 sats (enable launches to deploy)";
+    }
+  }
+
+  refreshManualLaunchReadout(): void {
+    const host = document.getElementById("odc-manual-readout")!;
+    const fleet = this.computeManualFleetCapacity();
+    const spsl = effectiveSatsPerLaunch(this.odcLaunchPhysics);
+    if (fleet.totalLaunches <= 0) {
+      host.innerHTML = `<div class="odc-compute-row"><span>Network</span><strong>Set launches on enabled shells</strong></div>
+        <div class="odc-compute-row"><span>Packing</span><strong>${spsl} sats/launch @ ${this.odcLaunchPhysics.payloadTon} t</strong></div>`;
+      return;
+    }
+    host.innerHTML = `
+      <div class="odc-compute-section-title">Manual launch plan</div>
+      <div class="odc-compute-row"><span>Launches</span><strong>${fleet.totalLaunches.toLocaleString()}</strong></div>
+      <div class="odc-compute-row"><span>Deployed</span><strong>${fleet.deployedSats.toLocaleString()} sats</strong></div>
+      <div class="odc-compute-row"><span>Orbital power</span><strong>${formatGw(fleet.powerGw)}</strong></div>
+      <div class="odc-compute-row"><span>Orbital compute</span><strong>${formatComputeTflops(fleet.computeTflops)} · ${formatRubinMultiple(fleet.rubinMultiple)}</strong></div>
+      <div class="odc-compute-row"><span>Packing</span><strong>${spsl} sats/launch · ${this.odcLaunchPhysics.satMassTon} t/sat · ${this.odcLaunchPhysics.powerMwPerSat} MW/sat</strong></div>
+    `;
+    for (const g of ORBIT_GROUPS) {
+      for (let sh = 0; sh < g.shells; sh++) {
+        this.refreshShellLaunchMeta(g, sh);
+      }
+    }
+  }
+
+  private notifyManualLaunchChange(): void {
+    this.handlers.onOdcManualLaunchChange();
+    this.handlers.onOdcShareChange();
+  }
+
 
   private buildOdcGroupPanel(): void {
     const host = document.getElementById("odc-groups")!;
@@ -656,6 +1069,41 @@ export class ControlPanel {
         shellCb.type = "checkbox";
         shellCb.checked = false;
         const key = this.odcShellKey(g.id, sh);
+
+        const launchRow = document.createElement("div");
+        launchRow.className = "odc-shell-launch";
+        const launchLabel = document.createElement("label");
+        launchLabel.textContent = "Launches ";
+        const launchVal = document.createElement("span");
+        launchVal.className = "odc-shell-launch-val";
+        launchVal.dataset.shellKey = key;
+        launchVal.textContent = "0";
+        const launchSlider = document.createElement("input");
+        launchSlider.type = "range";
+        launchSlider.min = "0";
+        launchSlider.max = "1";
+        launchSlider.step = "1";
+        launchSlider.value = "0";
+        launchSlider.disabled = true;
+        launchSlider.addEventListener("input", () => {
+          const n = Number(launchSlider.value);
+          if (n > 0) this.odcShellLaunches.set(key, n);
+          else this.odcShellLaunches.delete(key);
+          launchVal.textContent = String(n);
+          this.refreshShellLaunchMeta(g, sh);
+          this.refreshManualLaunchReadout();
+          this.notifyManualLaunchChange();
+        });
+        this.odcShellLaunchSliders.set(key, launchSlider);
+        launchLabel.appendChild(launchVal);
+        launchLabel.appendChild(launchSlider);
+        const launchMeta = document.createElement("span");
+        launchMeta.className = "odc-shell-launch-meta";
+        launchMeta.textContent = "→ 0 sats (enable shell first)";
+        this.odcShellLaunchMetas.set(key, launchMeta);
+        launchRow.appendChild(launchLabel);
+        launchRow.appendChild(launchMeta);
+
         shellCb.addEventListener("change", () => {
           let set = this.enabledOdcShells.get(g.id);
           if (!set) {
@@ -665,6 +1113,17 @@ export class ControlPanel {
           if (shellCb.checked) set.add(sh);
           else set.delete(sh);
           if (set.size === 0) this.enabledOdcShells.delete(g.id);
+          launchSlider.disabled = !shellCb.checked;
+          if (!shellCb.checked) {
+            this.odcShellLaunches.delete(key);
+            launchSlider.value = "0";
+            launchVal.textContent = "0";
+            this.refreshShellLaunchMeta(g, sh);
+            this.refreshManualLaunchReadout();
+            this.notifyManualLaunchChange();
+          } else {
+            this.syncShellLaunchSlider(g, sh);
+          }
           this.syncOdcGroupMaster(g);
           this.handlers.onOdcShellsChange();
           this.refreshStats();
@@ -675,6 +1134,7 @@ export class ControlPanel {
           ` Shell ${sh} · ~${altKm.toFixed(0)} km · ${(g.planesPerShell * g.satsPerPlane).toLocaleString()} nominal`
         );
         shellLi.appendChild(shellLabel);
+        shellLi.appendChild(launchRow);
         shellList.appendChild(shellLi);
       }
 
@@ -683,6 +1143,7 @@ export class ControlPanel {
       li.appendChild(shellList);
       host.appendChild(li);
     }
+    this.syncAllShellLaunchSliders();
     this.updateOdcGroupMetas();
   }
 
@@ -697,15 +1158,17 @@ export class ControlPanel {
   private syncOdcShellCheckboxes(g: OrbitGroupConfig): void {
     const shells = this.enabledOdcShells.get(g.id) ?? new Set();
     for (let sh = 0; sh < g.shells; sh++) {
-      const cb = this.odcShellCheckboxes.get(this.odcShellKey(g.id, sh));
+      const key = this.odcShellKey(g.id, sh);
+      const cb = this.odcShellCheckboxes.get(key);
       if (cb) cb.checked = shells.has(sh);
+      const slider = this.odcShellLaunchSliders.get(key);
+      if (slider) slider.disabled = !shells.has(sh);
     }
     this.syncOdcGroupMaster(g);
   }
 
   updateOdcGroupMetas(): void {
     const model = this.getModel();
-    const divisor = model.buildParams.sampleDivisor;
     for (const g of ORBIT_GROUPS) {
       const meta = document.querySelector(`.odc-meta[data-group-id="${g.id}"]`)!;
       const shells = this.enabledOdcShells.get(g.id);
@@ -716,13 +1179,194 @@ export class ControlPanel {
       const planes = model.planesByGroup.get(g.id) ?? [];
       const vis = planes.reduce((n, p) => n + p.satellites.length, 0);
       const nominalOn = shells.size * g.planesPerShell * g.satsPerPlane;
-      const gpu = model.gpuBuffers.get(g.id);
-      if (gpu) {
-        meta.textContent = ` · GPU ${gpu.displaySats.toLocaleString()} pts · 1:${divisor}`;
-      } else {
-        meta.textContent = ` · ${vis.toLocaleString()} drawn · ${nominalOn.toLocaleString()} nominal shell cap · 1:${divisor}`;
-      }
+      meta.textContent = ` · ${vis.toLocaleString()} drawn · ${nominalOn.toLocaleString()} nominal (on)`;
     }
+  }
+
+  private buildOdcLaunchScenarioSelect(): void {
+    const sel = document.getElementById("odc-launch-scenario") as HTMLSelectElement;
+    sel.innerHTML = "";
+    for (const s of ODC_LAUNCH_SCENARIOS) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = s.label;
+      if (s.id === this.odcLaunchScenario) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    this.syncOdcSimYearSlider();
+    this.updateOdcLaunchScenarioHint();
+    this.refreshOdcComputeReadout();
+  }
+
+  private syncOdcSimYearSlider(): void {
+    const scenario = odcLaunchScenarioById(this.odcLaunchScenario);
+    const slider = document.getElementById("odc-sim-year") as HTMLInputElement;
+    slider.min = String(scenario.startYear);
+    slider.max = String(scenario.endYear);
+    if (this.odcSimYear < scenario.startYear) this.odcSimYear = scenario.startYear;
+    if (this.odcSimYear > scenario.endYear) this.odcSimYear = scenario.endYear;
+    slider.value = String(this.odcSimYear);
+    (document.getElementById("odc-sim-year-val") as HTMLElement).textContent = String(this.odcSimYear);
+  }
+
+  private wireOdcComputeControls(): void {
+    (document.getElementById("odc-launch-scenario") as HTMLSelectElement).addEventListener("change", (e) => {
+      this.odcLaunchScenario = (e.target as HTMLSelectElement).value as OdcLaunchScenarioId;
+      this.syncOdcSimYearSlider();
+      this.updateOdcLaunchScenarioHint();
+      this.refreshOdcComputeReadout();
+      this.syncOdcDeployView();
+      this.notifyOdcShareChange();
+    });
+
+    const yearSlider = document.getElementById("odc-sim-year") as HTMLInputElement;
+    yearSlider.addEventListener("input", () => {
+      this.odcSimYear = Number(yearSlider.value);
+      (document.getElementById("odc-sim-year-val") as HTMLElement).textContent = yearSlider.value;
+      this.refreshOdcComputeReadout();
+      this.syncOdcDeployView();
+      this.notifyOdcShareChange();
+    });
+
+    (document.getElementById("odc-fill-order") as HTMLSelectElement).addEventListener("change", (e) => {
+      this.odcFillOrder = (e.target as HTMLSelectElement).value as DeploymentFillOrder;
+      this.refreshOdcComputeReadout();
+      this.syncOdcDeployView();
+      this.notifyOdcShareChange();
+    });
+
+    (document.getElementById("odc-compute-tier") as HTMLSelectElement).addEventListener("change", (e) => {
+      const val = (e.target as HTMLSelectElement).value;
+      this.odcTierOverride = val ? (val as OdcComputeTierId) : undefined;
+      this.refreshOdcComputeReadout();
+      this.notifyOdcShareChange();
+    });
+
+    (document.getElementById("odc-deploy-3d") as HTMLInputElement).addEventListener("change", (e) => {
+      const on = (e.target as HTMLInputElement).checked;
+      this.odcDeploy3d = on;
+      if (on) {
+        const gpu = document.getElementById("odc-representative") as HTMLInputElement;
+        if (!gpu.checked) {
+          gpu.checked = true;
+          this.handlers.onOdcRepresentativeModeChange(true);
+        }
+      }
+      this.syncOdcDeployView();
+      this.notifyOdcShareChange();
+    });
+
+    (document.getElementById("odc-launch-train") as HTMLInputElement).addEventListener("change", (e) => {
+      this.odcLaunchTrain = (e.target as HTMLInputElement).checked;
+      if (this.odcLaunchTrain && !this.odcDeploy3d) {
+        const deploy3d = document.getElementById("odc-deploy-3d") as HTMLInputElement;
+        deploy3d.checked = true;
+        this.odcDeploy3d = true;
+        const gpu = document.getElementById("odc-representative") as HTMLInputElement;
+        if (!gpu.checked) {
+          gpu.checked = true;
+          this.handlers.onOdcRepresentativeModeChange(true);
+        }
+      }
+      this.syncOdcDeployView();
+      this.notifyOdcShareChange();
+    });
+
+    document.getElementById("btn-odc-copy-summary")!.addEventListener("click", () => {
+      void this.copyOdcCapacitySummary();
+    });
+  }
+
+  private setOdcComputeStatus(msg: string): void {
+    const el = document.getElementById("odc-compute-status");
+    if (el) el.textContent = msg;
+  }
+
+  private async copyOdcCapacitySummary(): Promise<void> {
+    const scenario = odcLaunchScenarioById(this.odcLaunchScenario);
+    const schedule = this.expandedOdcSchedule();
+    const sim = simulateOdcDeployment(schedule, { fillOrder: this.odcFillOrder });
+    const text = buildOdcCapacitySummaryText(scenario, sim, this.odcSimYear);
+    try {
+      await navigator.clipboard.writeText(text);
+      this.setOdcComputeStatus("Capacity summary copied");
+    } catch {
+      this.setOdcComputeStatus("Copy failed — check browser permissions");
+    }
+  }
+
+  private updateOdcLaunchScenarioHint(): void {
+    const hint = document.getElementById("odc-launch-scenario-hint")!;
+    hint.textContent = odcLaunchScenarioById(this.odcLaunchScenario).description;
+  }
+
+  private buildOdcComputeTierSelect(): void {
+    const sel = document.getElementById("odc-compute-tier") as HTMLSelectElement;
+    sel.innerHTML = "";
+    const fromScenario = document.createElement("option");
+    fromScenario.value = "";
+    fromScenario.textContent = "From scenario phases";
+    fromScenario.selected = !this.odcTierOverride;
+    sel.appendChild(fromScenario);
+    for (const tier of Object.values(ODC_COMPUTE_TIERS)) {
+      const opt = document.createElement("option");
+      opt.value = tier.id;
+      opt.textContent = tier.label;
+      if (this.odcTierOverride === tier.id) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
+
+  private buildOdcComputePanel(): void {
+    this.buildOdcComputeTierSelect();
+    this.wireOdcComputeControls();
+    this.buildOdcLaunchScenarioSelect();
+  }
+
+  refreshOdcComputeReadout(): void {
+    const host = document.getElementById("odc-compute-readout")!;
+    const chart = document.getElementById("odc-capacity-chart") as HTMLCanvasElement;
+    const schedule = this.expandedOdcSchedule();
+    const sim = simulateOdcDeployment(schedule, { fillOrder: this.odcFillOrder });
+    const snap = snapshotAtYear(sim, this.odcSimYear);
+    const eff = effectiveSnapshot(snap, sim.deployment);
+    const duty = weightedSunDuty(sim.deployment);
+    const yearDelta = capacityDeltaSincePriorYear(sim, this.odcSimYear);
+    const capped = cappedSatsThroughYear(sim, this.odcSimYear);
+    const pct = ((snap.deployedSats / ODC_NOMINAL_TOTAL) * 100).toFixed(2);
+
+    const groupLines = groupEffectiveCapacities(snap, sim.deployment)
+      .map(
+        (g) =>
+          `<div class="odc-compute-row"><span>${g.name} · ${(g.sunDuty * 100).toFixed(0)}% sun</span><strong>${g.deployedSats.toLocaleString()} · ${formatComputeTflops(g.effectiveComputeTflops)}</strong></div>`
+      )
+      .join("");
+
+    const yearDeltaBlock =
+      yearDelta.sats > 0 || yearDelta.powerGw > 0 || yearDelta.computeTflops > 0
+        ? `<div class="odc-compute-section-title">In ${this.odcSimYear}</div>
+      <div class="odc-compute-row"><span>Sats launched</span><strong>+${yearDelta.sats.toLocaleString()}</strong></div>
+      <div class="odc-compute-row"><span>Power added</span><strong>+${formatGw(yearDelta.powerGw)}</strong></div>
+      <div class="odc-compute-row"><span>Compute added</span><strong>+${formatComputeTflops(yearDelta.computeTflops)}</strong></div>`
+        : "";
+
+    host.innerHTML = `
+      <div class="odc-compute-section-title">Cumulative @ ${this.odcSimYear}</div>
+      <div class="odc-compute-row"><span>Deployed</span><strong>${snap.deployedSats.toLocaleString()} / ${ODC_NOMINAL_TOTAL.toLocaleString()} (${pct}%)</strong></div>
+      <div class="odc-compute-row"><span>Power (nominal)</span><strong>${formatGw(snap.powerGw)}</strong></div>
+      <div class="odc-compute-row"><span>Power (sun-effective)</span><strong>${formatGw(eff.powerGw)} <span class="hint-inline">· ${(duty * 100).toFixed(0)}% avg duty</span></strong></div>
+      <div class="odc-compute-row"><span>Compute (nominal)</span><strong>${formatComputeTflops(snap.computeTflops)}</strong></div>
+      <div class="odc-compute-row"><span>Compute (sun-effective)</span><strong>${formatComputeTflops(eff.computeTflops)}</strong></div>
+      <div class="odc-compute-row"><span>vs Rubin DR11</span><strong>${formatRubinMultiple(snap.rubinMultiple)} nominal · ${formatRubinMultiple(eff.rubinMultiple)} eff</strong></div>
+      ${yearDeltaBlock}
+      ${capped > 0 ? `<div class="odc-compute-row cap-note"><span>Capped (filing limit)</span><strong>${capped.toLocaleString()}</strong></div>` : ""}
+      ${groupLines ? `<div class="odc-compute-section-title">By group</div><div class="odc-compute-groups">${groupLines}</div>` : ""}
+    `;
+
+    drawOdcCapacityChart(chart, {
+      timeline: sim.timeline,
+      highlightYear: this.odcSimYear,
+    });
   }
 
   private buildScenarioSelect(): void {
@@ -812,33 +1456,46 @@ export class ControlPanel {
 
   rebuildStarlinkGen3ShellList(): void {
     this.starlinkGen3Checkboxes.clear();
-    const list = document.getElementById("starlink-gen3-shells")!;
-    list.innerHTML = "";
+    const partialList = document.getElementById("starlink-gen3-shells");
+    const filingList = document.getElementById("starlink-gen3-filing-shells");
+    if (partialList) partialList.innerHTML = "";
+    if (filingList) filingList.innerHTML = "";
     this.buildStarlinkGen3ShellList();
   }
 
   setStarlinkGen3Master(on: boolean): void {
     this.enabledStarlinkGen3.clear();
     if (on) {
-      for (const g of STARLINK_GEN3_PARTIAL) this.enabledStarlinkGen3.add(g.id);
+      for (const g of this.gen3Shells()) this.enabledStarlinkGen3.add(g.id);
     }
     this.syncStarlinkGen3Checkboxes();
   }
 
   private syncStarlinkGen3Checkboxes(): void {
-    const master = document.getElementById("starlink-gen3-master") as HTMLInputElement;
-    master.checked =
-      STARLINK_GEN3_PARTIAL.length > 0 &&
-      STARLINK_GEN3_PARTIAL.every((g) => this.enabledStarlinkGen3.has(g.id));
-    for (const g of STARLINK_GEN3_PARTIAL) {
+    const shells = this.gen3Shells();
+    const masters = [
+      document.getElementById("starlink-gen3-master") as HTMLInputElement | null,
+      document.getElementById("starlink-gen3-filing-master") as HTMLInputElement | null,
+    ];
+    const allOn = shells.length > 0 && shells.every((g) => this.enabledStarlinkGen3.has(g.id));
+    for (const master of masters) {
+      if (master) master.checked = allOn;
+    }
+    for (const g of shells) {
       const cb = this.starlinkGen3Checkboxes.get(g.id);
       if (cb) cb.checked = this.enabledStarlinkGen3.has(g.id);
     }
   }
 
   private buildStarlinkGen3ShellList(): void {
-    const list = document.getElementById("starlink-gen3-shells")!;
-    for (const g of STARLINK_GEN3_PARTIAL) {
+    const shells = this.gen3Shells();
+    const listId =
+      this.starlinkScenario === "gen3-filing"
+        ? "starlink-gen3-filing-shells"
+        : "starlink-gen3-shells";
+    const list = document.getElementById(listId);
+    if (!list) return;
+    for (const g of shells) {
       const li = document.createElement("li");
       const swatch = document.createElement("span");
       swatch.className = "swatch";

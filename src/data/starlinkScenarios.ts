@@ -9,10 +9,10 @@ import {
   type StarlinkGen2Inc365,
   type StarlinkGen2Mode,
 } from "./starlinkGen2";
-import { STARLINK_GEN3_PARTIAL } from "./starlinkGen3";
+import { STARLINK_GEN3_FILING, STARLINK_GEN3_PARTIAL } from "./starlinkGen3";
 import { starlinkGroupsForView } from "./starlinkDeployed";
 
-export type StarlinkScenarioId = "today" | "gen2-full" | "gen3-partial";
+export type StarlinkScenarioId = "today" | "gen2-full" | "gen3-partial" | "gen3-filing";
 
 export interface StarlinkScenarioDef {
   id: StarlinkScenarioId;
@@ -35,6 +35,12 @@ export const STARLINK_SCENARIOS: StarlinkScenarioDef[] = [
     id: "gen3-partial",
     label: "Gen3 partial (+ today)",
     description: "Jun 2026 operational constellation plus ~480 planned Gen3 sats (dashed).",
+  },
+  {
+    id: "gen3-filing",
+    label: "Gen3 as-filed (100k)",
+    description:
+      "SpaceX Gen3 NGSO filing — 20 VLEO shells (323–327.5 & 473–477.5 km), 100,000-sat system max.",
   },
 ];
 
@@ -76,6 +82,15 @@ export function scenarioApplyHints(scenarioId: StarlinkScenarioId): ScenarioAppl
         gen2Inc365: "28",
         enableAllStarlink: false,
       };
+    case "gen3-filing":
+      return {
+        view: "nominal",
+        snapshotId: "2026-06-03",
+        gen1Mode: "deployed",
+        gen2Mode: "granted",
+        gen2Inc365: "28",
+        enableAllStarlink: false,
+      };
     default:
       return {
         view: "operational",
@@ -100,6 +115,8 @@ export function starlinkGroupsForScenario(
       ];
     case "gen3-partial":
       return [...starlinkDeployedGroups("2026-06-03"), ...STARLINK_GEN3_PARTIAL];
+    case "gen3-filing":
+      return [...STARLINK_GEN3_FILING];
     case "today":
     default:
       return starlinkGroupsForView(ctx.view, ctx.snapshotId, {

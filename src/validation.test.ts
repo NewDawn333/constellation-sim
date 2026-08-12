@@ -518,6 +518,33 @@ describe("Phase 9 · scenarios & share", () => {
     expect(future.reduce((n, g) => n + g.maxSats, 0)).toBe(STARLINK_GEN3_PARTIAL_NOMINAL);
   });
 
+  it("gen3-filing scenario is the as-filed 100k VLEO envelope", async () => {
+    const { starlinkGroupsForScenario } = await import("./data/starlinkScenarios");
+    const {
+      STARLINK_GEN3_FILING_NOMINAL,
+      STARLINK_GEN3_SYSTEM_MAX,
+    } = await import("./data/starlinkGen3");
+    const groups = starlinkGroupsForScenario("gen3-filing", {
+      view: "nominal",
+      snapshotId: "2026-06-03",
+      gen1Mode: "deployed",
+      gen2Mode: "granted",
+      gen2Inc365: "28",
+    });
+    expect(groups).toHaveLength(20);
+    expect(groups.every((g) => g.id >= 601 && g.id <= 620)).toBe(true);
+    expect(groups.some((g) => g.future)).toBe(false);
+    expect(STARLINK_GEN3_FILING_NOMINAL).toBe(STARLINK_GEN3_SYSTEM_MAX);
+    expect(groups.reduce((n, g) => n + g.maxSats, 0)).toBe(100_000);
+    expect(groups.map((g) => g.altitudeKm[0])).toEqual([
+      323, 323.5, 324, 324.5, 325, 325.5, 326, 326.5, 327, 327.5, 473, 473.5, 474, 474.5, 475,
+      475.5, 476, 476.5, 477, 477.5,
+    ]);
+    expect(groups.map((g) => g.inclinationDeg)).toEqual([
+      26, 32, 38, 43, 48, 53, 60, 69, 76, 96.9, 26, 32, 38, 43, 48, 53, 60, 69, 76, 96.9,
+    ]);
+  });
+
   it("future groups are excluded from coverage stamps", async () => {
     const THREE = await import("three");
     const { buildCoverageGrid } = await import("./model/coverageGrid");
@@ -539,6 +566,8 @@ describe("Phase 9 · scenarios & share", () => {
   it("Gen3 shell ids map to v3 hardware", async () => {
     const { hardwareClassForShellId } = await import("./data/starlinkHardware");
     expect(hardwareClassForShellId(501)).toBe("v3");
+    expect(hardwareClassForShellId(601)).toBe("v3");
+    expect(hardwareClassForShellId(620)).toBe("v3");
   });
 
   it("share state round-trips through URL hash", async () => {

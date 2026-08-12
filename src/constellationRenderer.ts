@@ -5,7 +5,9 @@ import {
   type UnifiedConstellation,
 } from "./constellation";
 import { createGroundTrackLine, shouldDrawGroundTrack } from "./render/groundTrack";
-import { OdcGpuSatLayer, cameraSceneDistance } from "./render/odcGpuSats";
+import { OdcGpuSatLayer, cameraSceneDistance, type OdcDeployVisualState, type OdcManualLaunchVisualState } from "./render/odcGpuSats";
+import type { GroupDisplayDeployAttributes } from "./model/odcDeployIndex";
+import { buildShellSlotAttributes } from "./model/representativeBuffer";
 import { createPerShellBandGroup } from "./render/shellThicknessBands";
 import { createShellBandGroup } from "./render/shellBands";
 import { orbitRingPoints, planeKey, positionOnPlane, type OrbitalPlane } from "./orbits";
@@ -68,6 +70,8 @@ export class ConstellationRenderer {
   private autoLod = true;
   private zoomCull = false;
   private camera: THREE.Camera | null = null;
+  private odcDeployAttrs = new Map<number, GroupDisplayDeployAttributes>();
+  private odcShellSlotAttrs = new Map<number, ReturnType<typeof buildShellSlotAttributes>>();
 
   constructor(scene: THREE.Scene, earthGroup: THREE.Group, model: UnifiedConstellation) {
     this.scene = scene;
@@ -92,6 +96,29 @@ export class ConstellationRenderer {
 
   setCamera(camera: THREE.Camera): void {
     this.camera = camera;
+  }
+
+  setOdcDeployAttributes(attrs: Map<number, GroupDisplayDeployAttributes>): void {
+    this.odcDeployAttrs = attrs;
+    for (const [groupId, deploy] of attrs) {
+      this.groupGpuLayers.get(groupId)?.setDeployAttributes(deploy);
+    }
+  }
+
+  setOdcDeploymentVisual(state: Partial<OdcDeployVisualState>): void {
+    for (const layer of this.groupGpuLayers.values()) {
+      layer.setDeployVisual(state);
+    }
+  }
+
+  setOdcManualLaunchVisual(groupId: number, state: Partial<OdcManualLaunchVisualState>): void {
+    this.groupGpuLayers.get(groupId)?.setManualLaunchVisual(state);
+  }
+
+  setAllOdcManualLaunchVisual(states: Map<number, Partial<OdcManualLaunchVisualState>>): void {
+    for (const [groupId, state] of states) {
+      this.setOdcManualLaunchVisual(groupId, state);
+    }
   }
 
   isGpuGroup(groupId: number): boolean {
@@ -184,7 +211,10 @@ export class ConstellationRenderer {
       const vis = gpuBuf.displaySats;
       const userScale = this.model.buildParams.satPointScale ?? 1;
       const ptScale = resolveGpuPointScale(vis, userScale, isPolarGroup(g) ? 1.4 : 1);
-      const layer = new OdcGpuSatLayer(gpuBuf, g.color, ptScale);
+      const deploy = this.odcDeployAttrs.get(groupId) ?? null;
+      const shellSlots = buildShellSlotAttributes(g, this.model.buildParams);
+      if (shellSlots) this.odcShellSlotAttrs.set(groupId, shellSlots);
+      const layer = new OdcGpuSatLayer(gpuBuf, g.color, ptScale, deploy, shellSlots);
       this.groupGpuLayers.set(groupId, layer);
       this.scene.add(layer.mesh);
       this.slotIndexByGroup.set(groupId, []);

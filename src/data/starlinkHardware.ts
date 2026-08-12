@@ -97,13 +97,13 @@ export const DEFAULT_HARDWARE_FILTER: HardwareClassFilter = {
 const GEN1_SHELL_IDS = new Set([301, 302, 303, 304, 305, 306]);
 const V2M_SHELL_IDS = new Set([401, 402, 405, 406, 407, 408, 409]);
 const DTC_SHELL_IDS = new Set([403, 404]);
-const GEN3_SHELL_IDS = new Set([501, 502, 503, 504]);
+const GEN3_PARTIAL_SHELL_IDS = new Set([501, 502, 503, 504]);
 
 export function hardwareClassForShellId(
   shellId: number,
   snapshotAsOf = "2026-06-03"
 ): HardwareClassId {
-  if (GEN3_SHELL_IDS.has(shellId)) return "v3";
+  if (GEN3_PARTIAL_SHELL_IDS.has(shellId) || (shellId >= 601 && shellId <= 620)) return "v3";
   if (GEN1_SHELL_IDS.has(shellId)) return "v1.5";
   if (V2M_SHELL_IDS.has(shellId)) return "v2m";
   if (DTC_SHELL_IDS.has(shellId)) {

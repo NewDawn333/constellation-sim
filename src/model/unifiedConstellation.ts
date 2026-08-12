@@ -5,6 +5,12 @@ import {
   type RepresentativeSatBuffer,
 } from "./representativeBuffer";
 import {
+  deployedSatsForShell,
+  effectiveSatsPerLaunch,
+  shellKey,
+  type OdcLaunchPhysics,
+} from "./odcManualLaunch";
+import {
   buildOrbitalPlanes,
   type BuildParams,
   DEFAULT_BUILD_PARAMS,
@@ -40,6 +46,11 @@ export interface UnifiedConstellation {
 export interface OdcBuildOptions {
   /** groupId → enabled shell indices. Omitted shells are not built. */
   enabledShellsByGroup?: Map<number, Set<number>>;
+  /** Manual launch planner: physics + per-shell launch counts. */
+  manualLaunch?: {
+    physics: OdcLaunchPhysics;
+    shellLaunches: Map<string, number>;
+  };
 }
 
 export function buildUnifiedConstellation(
@@ -66,8 +77,26 @@ export function buildUnifiedConstellation(
       continue;
     }
 
+    const deployedSatsByShell = new Map<number, number>();
+    let groupHasManualDeploy = false;
+    if (g.layer === "odc" && odcOptions.manualLaunch && odcShells) {
+      const spsl = effectiveSatsPerLaunch(odcOptions.manualLaunch.physics);
+      for (const sh of odcShells) {
+        const launches = odcOptions.manualLaunch.shellLaunches.get(shellKey(g.id, sh)) ?? 0;
+        const deployed = deployedSatsForShell(g, launches, spsl);
+        deployedSatsByShell.set(sh, deployed);
+        if (deployed > 0) groupHasManualDeploy = true;
+      }
+    }
+
+    const useGpuRepresentative =
+      g.layer === "odc" &&
+      params.odcRepresentativeMode &&
+      !groupHasManualDeploy &&
+      (!shellFilterProvided || (odcShells && odcShells.size > 0));
+
     const planeParams: BuildParams =
-      g.layer === "odc" && params.odcRepresentativeMode
+      g.layer === "odc" && useGpuRepresentative
         ? {
             ...params,
             tracksOnly: true,
@@ -81,6 +110,12 @@ export function buildUnifiedConstellation(
               odcUncappedDensity: true,
               maxSatsPerPlaneCap: 0,
               enabledShellIndices: odcShells,
+              deployedSatsByShell: deployedSatsByShell.size > 0 ? deployedSatsByShell : undefined,
+              manualSatsPerLaunch:
+                deployedSatsByShell.size > 0
+                  ? effectiveSatsPerLaunch(odcOptions.manualLaunch!.physics)
+                  : undefined,
+              odcManualLaunchExact: groupHasManualDeploy,
             }
           : {
               ...params,
@@ -101,7 +136,7 @@ export function buildUnifiedConstellation(
     planesByGroup.set(g.id, groupPlanes);
     planes.push(...groupPlanes);
 
-    if (g.layer === "odc" && params.odcRepresentativeMode && (!shellFilterProvided || (odcShells && odcShells.size > 0))) {
+    if (useGpuRepresentative) {
       gpuBuffers.set(
         g.id,
         buildRepresentativeSatBuffer(g, {
@@ -181,7 +216,8 @@ export interface ConstellationStats {
 
 export function computeStats(
   model: UnifiedConstellation,
-  enabledGroupIds: Set<number>
+  enabledGroupIds: Set<number>,
+  enabledShellsByGroup?: Map<number, Set<number>>
 ): ConstellationStats {
   let totalShells = 0;
   let totalPlanes = 0;
@@ -220,25 +256,29 @@ export function computeStats(
 
     layerStats.enabledGroups++;
     if (topology) topology.enabledGroups++;
-    totalShells += g.shells;
-    nominalSats += g.maxSats;
-    layerStats.nominalSats += g.maxSats;
-    if (topology) topology.nominalSats += g.maxSats;
+
+    const odcShells =
+      g.layer === "odc" && enabledShellsByGroup
+        ? enabledShellsByGroup.get(g.id)
+        : undefined;
+    const odcShellCount = g.layer === "odc" && odcShells ? odcShells.size : g.shells;
+    const odcNominalOn =
+      g.layer === "odc" && odcShells
+        ? odcShellCount * g.planesPerShell * g.satsPerPlane
+        : g.maxSats;
+
+    totalShells += odcShellCount;
+    nominalSats += odcNominalOn;
+    layerStats.nominalSats += odcNominalOn;
+    if (topology) topology.nominalSats += odcNominalOn;
 
     const groupPlanes = model.planesByGroup.get(g.id)!;
     totalPlanes += groupPlanes.length;
     if (topology) topology.totalPlanes += groupPlanes.length;
-    const gpuBuf = model.gpuBuffers.get(g.id);
-    if (gpuBuf) {
-      visibleSats += gpuBuf.displaySats;
-      layerStats.visibleSats += gpuBuf.displaySats;
-      if (topology) topology.visibleSats += gpuBuf.displaySats;
-    } else {
-      for (const p of groupPlanes) {
-        visibleSats += p.satellites.length;
-        layerStats.visibleSats += p.satellites.length;
-        if (topology) topology.visibleSats += p.satellites.length;
-      }
+    for (const p of groupPlanes) {
+      visibleSats += p.satellites.length;
+      layerStats.visibleSats += p.satellites.length;
+      if (topology) topology.visibleSats += p.satellites.length;
     }
     for (const p of groupPlanes) {
       altMin = Math.min(altMin, p.physicalAltitudeKm);

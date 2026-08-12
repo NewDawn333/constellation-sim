@@ -1,6 +1,7 @@
 import * as THREE from "three";
 
 import type { SatLayoutMode } from "./data/groupConfig";
+import { buildOdcDataCenterSatellites } from "./model/odcDataCenterLayout";
 
 const R_EARTH_KM = 6371;
 const MU_EARTH = 3.986004418e14;
@@ -24,6 +25,12 @@ export interface BuildParams {
   odcUncappedDensity?: boolean;
   /** If set, only build these shell indices (ODC progressive reveal). */
   enabledShellIndices?: Set<number>;
+  /** Per-shell deployed sat count (manual launch planner). Shell index → nominal sats placed. */
+  deployedSatsByShell?: Map<number, number>;
+  /** Satellites per Starship launch (launch_train batch size). */
+  manualSatsPerLaunch?: number;
+  /** Show every deployed sat (ignore density divisor). */
+  odcManualLaunchExact?: boolean;
   /** 0 = true scale; else fraction of visual baseline (0.01 = 1%). */
   satPointScale?: number;
   /** When true, build plane rings without along-track satellite slots. */
@@ -168,6 +175,9 @@ function effectiveAltitudeKm(
 }
 
 export function visualSatsPerPlane(nominal: number, params: BuildParams): number {
+  if (params.odcManualLaunchExact) {
+    return Math.max(0, nominal);
+  }
   const { sampleDivisor, maxSatsPerPlaneCap } = params;
   const uncapped = params.odcUncappedDensity || maxSatsPerPlaneCap === 0;
 
@@ -226,13 +236,67 @@ export function buildOrbitalPlanes(
   params: BuildParams = DEFAULT_BUILD_PARAMS
 ): OrbitalPlane[] {
   const [lo, hi] = altitudeKm;
-  const isLaunchTrain = params.satLayout === "launch_train";
-  const trainSize = params.launchTrainSize ?? satsPerPlane;
-  const totalSats = params.totalSats ?? planesPerShell * satsPerPlane;
   const planes: OrbitalPlane[] = [];
 
   for (let sh = 0; sh < shells; sh++) {
     if (params.enabledShellIndices && !params.enabledShellIndices.has(sh)) continue;
+
+    const shellDeploy = params.deployedSatsByShell?.get(sh);
+    if (shellDeploy !== undefined) {
+      if (shellDeploy <= 0) {
+        const { physical, visual } = effectiveAltitudeKm(lo, hi, sh, shells, params.altitudeExaggeration);
+        const incDeg = shellInclinationDeg(inclinationDeg, sh, shells);
+        const incRad = (incDeg * Math.PI) / 180;
+        const radius = 1 + visual * KM_TO_SCENE;
+        const omega = meanMotionRadPerSec(physical);
+        for (let pl = 0; pl < planesPerShell; pl++) {
+          const raanRad = (pl / planesPerShell) * Math.PI * 2;
+          planes.push({
+            groupId,
+            shellIndex: sh,
+            planeIndex: pl,
+            altitudeKm: visual,
+            physicalAltitudeKm: physical,
+            inclinationDeg: incDeg,
+            radius,
+            inclinationRad: incRad,
+            raanRad,
+            meanMotionRadPerSec: omega,
+            nominalSatsPerPlane: satsPerPlane,
+            satellites: [],
+          });
+        }
+        continue;
+      }
+
+      const { physical, visual } = effectiveAltitudeKm(lo, hi, sh, shells, params.altitudeExaggeration);
+      const incDeg = shellInclinationDeg(inclinationDeg, sh, shells);
+      const incRad = (incDeg * Math.PI) / 180;
+      const radius = 1 + visual * KM_TO_SCENE;
+      const omega = meanMotionRadPerSec(physical);
+      const shellPhase = (sh / shells) * (Math.PI * 2) / planesPerShell;
+      const spsl = Math.max(1, params.manualSatsPerLaunch ?? shellDeploy);
+      const chain = buildOdcDataCenterSatellites(shellDeploy, spsl, physical, shellPhase);
+
+      for (let pl = 0; pl < planesPerShell; pl++) {
+        const raanRad = (pl / planesPerShell) * Math.PI * 2;
+        planes.push({
+          groupId,
+          shellIndex: sh,
+          planeIndex: pl,
+          altitudeKm: visual,
+          physicalAltitudeKm: physical,
+          inclinationDeg: incDeg,
+          radius,
+          inclinationRad: incRad,
+          raanRad,
+          meanMotionRadPerSec: omega,
+          nominalSatsPerPlane: pl === 0 ? shellDeploy : 0,
+          satellites: pl === 0 ? chain : [],
+        });
+      }
+      continue;
+    }
 
     const { physical, visual } = effectiveAltitudeKm(lo, hi, sh, shells, params.altitudeExaggeration);
     const incDeg = shellInclinationDeg(inclinationDeg, sh, shells);
@@ -240,9 +304,12 @@ export function buildOrbitalPlanes(
     const radius = 1 + visual * KM_TO_SCENE;
     const omega = meanMotionRadPerSec(physical);
     const shellPhase = (sh / shells) * (Math.PI * 2) / planesPerShell;
+    const shellIsLaunchTrain = params.satLayout === "launch_train";
+    const trainSize = params.launchTrainSize ?? satsPerPlane;
+    const totalSats = params.totalSats ?? planesPerShell * satsPerPlane;
 
     for (let pl = 0; pl < planesPerShell; pl++) {
-      const nominalInPlane = isLaunchTrain
+      const nominalInPlane = shellIsLaunchTrain
         ? satsInLaunchTrainPlane(pl, totalSats, trainSize)
         : satsPerPlane;
       if (nominalInPlane <= 0) continue;

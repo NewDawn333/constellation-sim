@@ -1,5 +1,13 @@
 import type { StarlinkScenarioId } from "./data/starlinkScenarios";
 import type { StarlinkViewMode } from "./data/starlinkDeployed";
+import {
+  defaultOdcShareState,
+  encodeOdcShareHash,
+  extractOdcHashFromLocation,
+  type OdcShareState,
+} from "./shareOdcState";
+
+export type { OdcShareState };
 
 export const SHARE_STATE_VERSION = 1;
 
@@ -15,6 +23,7 @@ export interface SimShareState {
   concurrencyPct: number;
   minElevationDeg: number;
   nightSideDimming: boolean;
+  odc?: OdcShareState;
 }
 
 export function defaultShareState(): SimShareState {
@@ -51,12 +60,28 @@ export function decodeShareState(encoded: string): SimShareState | null {
 }
 
 export function shareUrlFromState(state: SimShareState, baseUrl = window.location.href.split("#")[0]!): string {
-  return `${baseUrl}#s=${encodeShareState(state)}`;
+  const odc = state.odc ?? defaultOdcShareState();
+  const odcSeg = encodeOdcShareHash(odc);
+  return `${baseUrl}#s=${encodeShareState(state)}&odc=${odcSeg}`;
 }
 
 export function readShareStateFromLocation(): SimShareState | null {
   const hash = window.location.hash;
-  const m = hash.match(/^#s=([A-Za-z0-9_-]+)$/);
-  if (!m) return null;
-  return decodeShareState(m[1]!);
+  const m = hash.match(/#s=([A-Za-z0-9_-]+)/);
+  const odc = extractOdcHashFromLocation(hash);
+  if (!m && !odc) return null;
+
+  const sim = m ? decodeShareState(m[1]!) : null;
+  if (sim && odc) {
+    sim.odc = odc;
+    return sim;
+  }
+  if (sim) {
+    if (!sim.odc) sim.odc = defaultOdcShareState();
+    return sim;
+  }
+  if (odc) {
+    return { ...defaultShareState(), odc };
+  }
+  return null;
 }
