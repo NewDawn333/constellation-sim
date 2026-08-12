@@ -166,7 +166,7 @@ UI additions (index.html / ui.ts):
 4. **Phase 8.1–8.2** — grid bandwidth on top of same positions
 5. **Phase 9** — V3 + scenarios
 
-Keep **`constellation-viz` untouched**; all work in `constellation-sim`.
+Work only in this folder (`~/Desktop/Final runs/SpaceX Orbital Simulator`).
 
 ---
 

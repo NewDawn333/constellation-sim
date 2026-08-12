@@ -1,5 +1,6 @@
 {
   "name": "constellation-sim",
+  "description": "SpaceX Orbital Simulator — Starlink and Orbital Data Center visualization",
   "private": true,
   "version": "1.0.0",
   "type": "module",

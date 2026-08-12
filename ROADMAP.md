@@ -1,7 +1,9 @@
-# Constellation Simulator — Roadmap
+# SpaceX Orbital Simulator — Roadmap
 
-**Stable demo:** `../constellation-viz` (do not break — reference only)  
-**Active development:** this directory (`constellation-sim`)
+**Canonical tree:** `~/Desktop/Final runs/SpaceX Orbital Simulator`  
+**GitHub:** https://github.com/NewDawn333/constellation-sim
+
+The old `constellation-viz` demo and other working copies are retired. Work only in this folder.
 
 ---
 
@@ -217,21 +219,15 @@ V3 nominal shells, scenario picker, export/share. See **COVERAGE_PHASE_PLAN.md**
 
 ```
 src/
-  data/
-    odc-table1.ts          # Orbital DC groups (current)
-    starlink-gen1.ts       # Phase 3
-    starlink-gen2.ts       # Phase 4
-  model/
-    constellation.ts       # buildConstellation()
-    orbitalMechanics.ts    # ECI transforms (orbits.ts today)
-  render/
-    earth.ts
-    tracks.ts
-    satellites.ts          # instancing + LOD
-  ui/
-    layerPanel.ts          # progressive reveal, density, exaggeration
-    inspector.ts           # shell/plane tree
-  app.ts
+  data/           # ODC Table 1, Starlink Gen1/2/3, hardware, snapshots
+  model/          # constellation build, launch/compute, coverage grid
+  render/         # Earth, GPU sats, tracks, coverage
+  ui/             # control panel (redesign next — keep this folder)
+    types.ts
+    controlPanel.ts
+    odcCapacityChart.ts
+  orbits.ts       # ECI / Walker math
+  main.ts         # bootstrap + animation loop
 ```
 
 Shared config shape:
@@ -252,7 +248,7 @@ interface ShellConfig {
 
 ## Recommended order of work
 
-1. **Phase 1** in `constellation-sim` — biggest UX win, low risk  
+1. **Phase 1** — biggest UX win, low risk  
 2. **Phase 2** — fixes perception of polar groups + inspection  
 3. **Phase 3** — Gen1 as sanity check against real orbits  
 4. **Phase 4** — Gen2 before pushing ODC to full scale  
@@ -263,14 +259,10 @@ interface ShellConfig {
 
 ## Running
 
-**Stable (unchanged):**
 ```bash
-cd constellation-viz && npm run dev   # → http://localhost:5174
-```
-
-**Development (roadmap work):**
-```bash
-cd constellation-sim && npm install && npm run dev   # use port 5175 (set in vite.config)
+cd ~/Desktop/Final\ runs/SpaceX\ Orbital\ Simulator
+npm install
+npm run dev    # → http://localhost:5175
 ```
 
 ---
